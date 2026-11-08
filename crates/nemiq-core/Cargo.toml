@@ -1,0 +1,20 @@
+[package]
+name = "nemiq-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Ray726-I/nemiq"
+description = "Document model and text logic for Nemiq: buffer, markdown scanning, search, word count, themes."
+
+[dependencies]
+ropey = "1.6"
+unicode-segmentation = "1.12"
+unicode-normalization = "0.1"
+regex = "1.11"
+fancy-regex = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3"

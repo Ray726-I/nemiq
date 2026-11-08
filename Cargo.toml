@@ -1,0 +1,12 @@
+[workspace]
+members = ["crates/nemiq-core", "crates/nemiq"]
+resolver = "2"
+
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
+
+# Debug builds otherwise spend tens of milliseconds shaping each line: GPUI's
+# text stack is unoptimized. Keep our own crates fast to compile but compile
+# dependencies as if they were release builds.
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,24 @@
+[package]
+name = "nemiq"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Ray726-I/nemiq"
+description = "A focused Markdown writing app built with GPUI"
+
+[[bin]]
+name = "nemiq"
+path = "src/main.rs"
+
+[dependencies]
+nemiq-core = { path = "../nemiq-core" }
+gpui = "*"
+ropey = "1.6"
+unicode-segmentation = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+notify = "6"
+rfd = "0.15"
+pulldown-cmark = "0.12"
