@@ -1084,7 +1084,7 @@ impl EditorView {
     }
 
     fn print_document(&mut self, _: &Print, _w: &mut Window, cx: &mut Context<Self>) {
-        self.state.status = "Printing is not available in the Rust port yet.".to_string();
+        self.state.status = "Printing is not available yet.".to_string();
         cx.notify();
     }
 
@@ -2739,8 +2739,7 @@ impl Render for EditorView {
                 ("Ctrl+Z", "Undo"),
                 ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
                 ("F11 / Super+F", "Fullscreen"),
-                ("Ctrl+F", "Find"),
-                ("Ctrl+H", "Find & Replace"),
+                ("Ctrl+F / Ctrl+H", "Find"),
                 ("Ctrl+G / Enter", "Next Match"),
                 ("Shift+Enter", "Previous Match"),
                 ("Escape", "Close Find"),

@@ -13,9 +13,10 @@ Bundled assets:
 - **IBM Plex Mono** (Regular, Italic, Bold, Bold Italic) — SIL Open Font
   License 1.1, see `fonts/OFL.txt`.
 
-Full text of the most common non-MIT license used here:
+License texts that have to travel with a binary:
 
 - Apache License 2.0 — `licenses/Apache-2.0.txt`
+- Mozilla Public License 2.0 — `licenses/MPL-2.0.txt`
 
 743 crates from `Cargo.lock`:
 
