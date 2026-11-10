@@ -32,8 +32,14 @@ else is a keyboard shortcut away.
 
 ## Build
 
-Requires a stable Rust toolchain and a Linux desktop. On Wayland the app needs
-`libxkbcommon`; X11 sessions also need the usual xcb libraries.
+Requires a stable Rust toolchain. Linux is the supported platform today, on
+both Wayland and X11; Wayland needs `libxkbcommon` and X11 sessions need the
+usual xcb libraries.
+
+Nothing in the editor is Linux-specific except the optional `wl-copy` helper
+for the HTML clipboard and reading Omarchy's theme file, and both degrade
+gracefully. A macOS build may therefore work, but it has not been tried.
+Windows is not supported — GPUI has no Windows backend.
 
 ```sh
 cargo run -p nemiq                 # empty document
