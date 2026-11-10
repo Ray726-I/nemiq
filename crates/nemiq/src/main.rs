@@ -116,6 +116,8 @@ fn main() {
             KeyBinding::new("f11", ToggleFullscreen, Some("Editor")),
             KeyBinding::new("f1", Shortcuts, Some("Editor")),
             KeyBinding::new("ctrl-/", Shortcuts, Some("Editor")),
+            KeyBinding::new("ctrl-shift-p", OpenPalette, Some("Editor")),
+            KeyBinding::new("ctrl-shift-p", OpenPalette, Some("Editor")),
             KeyBinding::new("ctrl-?", Shortcuts, Some("Editor")),
             KeyBinding::new("super-f", ToggleFullscreen, Some("Editor")),
             KeyBinding::new("shift-enter", FindPrev, Some("Editor")),

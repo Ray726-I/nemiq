@@ -146,7 +146,7 @@ fn html_to_pdf(html: &str, out: &Path) -> Result<(), String> {
     let url = format!("file://{}", tmp.display());
     let out_abs = std::fs::canonicalize(out)
         .or_else(|_| {
-            std::fs::write(out, b"");
+            let _ = std::fs::write(out, b"");
             std::fs::canonicalize(out)
         })
         .map_err(|e| e.to_string())?;

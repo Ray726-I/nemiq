@@ -27,6 +27,8 @@ else is a keyboard shortcut away.
   selected, Tab and Shift+Tab indent and outdent whole lines.
 - Font picker with a filter field, every usable family drawn in its own face,
   and a check mark on the current choice.
+- Command palette (`Ctrl+Shift+P`): type to filter every action, arrow keys to
+  pick, Enter to run.
 - Find and replace: `Ctrl+H` adds a replace field, with Replace and Replace
   All (a single undo step).
 - Copy the whole document as HTML (`Ctrl+Shift+C`), with a real `text/html`
@@ -87,6 +89,7 @@ on any machine.
 | `Ctrl+Backspace`, `Ctrl+Delete` | Delete a word backwards / forwards |
 | `Tab`, `Shift+Tab` | Indent, outdent |
 | `PageUp`, `PageDown` | Scroll a screen |
+| `Ctrl+Shift+P` | Command palette |
 | `F1`, `Ctrl+/`, `Ctrl+?` | Shortcut list |
 | `F11`, `Super+F` | Toggle fullscreen |
 

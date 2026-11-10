@@ -70,6 +70,7 @@ actions!(
         WordDelete,
         ToggleFullscreen,
         Shortcuts,
+        OpenPalette,
         DialogCancel,
         DialogDiscard,
         DialogSave,
@@ -307,6 +308,10 @@ pub struct EditorView {
     pub close_focus: usize,
     pub vim_enabled: bool,
     vim: VimState,
+    pub palette_open: bool,
+    palette_query: String,
+    palette_index: usize,
+    palette_window: usize,
     pub cmdline_open: bool,
     cmdline_text: String,
 }
@@ -383,6 +388,10 @@ impl EditorView {
             },
             cmdline_open: false,
             cmdline_text: String::new(),
+            palette_open: false,
+            palette_query: String::new(),
+            palette_index: 0,
+            palette_window: 0,
         }
     }
 
@@ -391,7 +400,8 @@ impl EditorView {
     }
 
     fn modal_open(&self) -> bool {
-        self.cmdline_open
+        self.palette_open
+            || self.cmdline_open
             || self.search_open
             || self.font_open
             || self.shortcuts_open
@@ -745,6 +755,13 @@ impl EditorView {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.palette_query.pop();
+            self.palette_index = 0;
+            self.palette_window = 0;
+            cx.notify();
+            return;
+        }
         if self.cmdline_open {
             self.cmdline_text.pop();
             cx.notify();
@@ -981,6 +998,10 @@ impl EditorView {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.run_palette(window, cx);
+            return;
+        }
         if self.cmdline_open {
             self.cmdline_execute(window, cx);
             return;
@@ -1619,6 +1640,12 @@ impl EditorView {
         cx.notify();
     }
     fn close_search(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.palette_open = false;
+            self.palette_query.clear();
+            cx.notify();
+            return;
+        }
         if self.cmdline_open {
             self.cmdline_open = false;
             self.cmdline_text.clear();
@@ -1701,6 +1728,89 @@ impl EditorView {
         self.search_text.push_str(text);
         self.refresh_search();
         self.jump_to_first_match(cx);
+        cx.notify();
+    }
+
+    // ---------- command palette ----------
+    fn filtered_palette(&self) -> Vec<PaletteEntry> {
+        let query = self.palette_query.trim().to_lowercase();
+        PALETTE
+            .iter()
+            .filter(|entry| query.is_empty() || entry.label.to_lowercase().contains(&query))
+            .copied()
+            .collect()
+    }
+
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_open = true;
+        self.search_open = false;
+        self.cmdline_open = false;
+        self.palette_query.clear();
+        self.palette_index = 0;
+        self.palette_window = 0;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn palette_move(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let len = self.filtered_palette().len();
+        if len == 0 {
+            return;
+        }
+        self.palette_index = (self.palette_index as i32 + dir).clamp(0, len as i32 - 1) as usize;
+        const ROWS: usize = 9;
+        if self.palette_index < self.palette_window {
+            self.palette_window = self.palette_index;
+        } else if self.palette_index >= self.palette_window + ROWS {
+            self.palette_window = self.palette_index + 1 - ROWS;
+        }
+        cx.notify();
+    }
+
+    fn run_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self.filtered_palette();
+        let Some(entry) = entries.get(self.palette_index).copied() else {
+            return;
+        };
+        self.palette_open = false;
+        self.palette_query.clear();
+        match entry.cmd {
+            PaletteCmd::Save => self.save(&Save, window, cx),
+            PaletteCmd::SaveAs => self.save_as_dialog(cx),
+            PaletteCmd::Open => self.open_dialog(&Open, window, cx),
+            PaletteCmd::NewWindow => self.new_window(&NewWindow, window, cx),
+            PaletteCmd::Export => self.print_document(&Print, window, cx),
+            PaletteCmd::Find => self.open_search(false, cx),
+            PaletteCmd::Replace => self.open_search(true, cx),
+            PaletteCmd::Shortcuts => self.open_shortcuts(&Shortcuts, window, cx),
+            PaletteCmd::Fullscreen => window.toggle_fullscreen(),
+            PaletteCmd::ZoomIn => self.zoom_in(&ZoomIn, window, cx),
+            PaletteCmd::ZoomOut => self.zoom_out(&ZoomOut, window, cx),
+            PaletteCmd::ZoomReset => self.zoom_reset(&ZoomReset, window, cx),
+            PaletteCmd::ToggleVim => {
+                self.vim_enabled = !self.vim_enabled;
+                self.vim = if self.vim_enabled {
+                    VimState::with_mode(VimMode::Normal)
+                } else {
+                    VimState::new()
+                };
+                self.state.save_vim_pref(self.vim_enabled);
+                self.state.status = if self.vim_enabled {
+                    "Vim mode on".to_string()
+                } else {
+                    "Vim mode off".to_string()
+                };
+            }
+            PaletteCmd::FontPicker => self.open_font_picker(window, cx),
+            PaletteCmd::CopyHtml => self.copy_as_html(&CopyAsHtml, window, cx),
+            PaletteCmd::Bold => self.toggle_wrap("**", cx),
+            PaletteCmd::Italic => self.toggle_wrap("*", cx),
+            PaletteCmd::Strike => self.toggle_wrap("~~", cx),
+            PaletteCmd::Link => self.insert_link(&Link, window, cx),
+            PaletteCmd::Undo => self.undo(&Undo, window, cx),
+            PaletteCmd::Redo => self.redo(&Redo, window, cx),
+            PaletteCmd::SelectAll => self.select_all(&SelectAll, window, cx),
+        }
         cx.notify();
     }
 
@@ -2022,6 +2132,12 @@ impl EditorView {
         if self.close_prompt || self.pending_external.is_some() {
             return;
         }
+        if self.palette_open {
+            self.palette_open = false;
+            self.palette_query.clear();
+            cx.notify();
+            return;
+        }
         if self.font_open {
             // Clicks on the panel itself stop propagation; anything reaching
             // here is a click outside and dismisses the picker.
@@ -2198,6 +2314,13 @@ impl EntityInputHandler for EditorView {
         if self.close_prompt || self.pending_external.is_some() {
             return;
         }
+        if self.palette_open {
+            self.palette_query.push_str(new_text);
+            self.palette_index = 0;
+            self.palette_window = 0;
+            cx.notify();
+            return;
+        }
         if self.cmdline_open {
             self.cmdline_text.push_str(new_text);
             cx.notify();
@@ -2283,14 +2406,16 @@ impl EditorView {
         let rest: String = chars[a..le].iter().collect();
 
         // List continuation: keep the marker, or drop an empty item.
-        if let Some(trimmed) = list_prefix(&line) {
-            if line.trim().is_empty() || rest.trim().is_empty() {
-                // empty item: drop the marker and leave a plain blank line
+        if let Some(prefix) = list_prefix(&line) {
+            let marker_len = prefix.chars().count();
+            let content: String = line.chars().skip(marker_len).collect();
+            if content.trim().is_empty() {
+                // Enter on an empty item ends the list.
                 self.replace(ls, le, String::new(), cx);
                 self.replace(ls, ls, "\n".to_string(), cx);
                 return;
             }
-            self.replace(a, a, format!("\n{trimmed}"), cx);
+            self.replace(a, a, format!("\n{prefix}"), cx);
             return;
         }
         if inside_fence_at(&t, a) {
@@ -2353,13 +2478,10 @@ fn inside_fence_at(text: &str, offset: usize) -> bool {
 fn list_prefix(line: &str) -> Option<String> {
     let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
     let t = line.trim_start();
-    if let Some(rest) = t
+    if let Some(_rest) = t
         .strip_prefix("- ")
         .or(t.strip_prefix("* ").or(t.strip_prefix("+ ")))
     {
-        if rest.trim().is_empty() {
-            return None;
-        }
         return Some(format!("{indent}{} ", &t[..1]));
     }
     let mut num_end = 0usize;
@@ -2373,9 +2495,6 @@ fn list_prefix(line: &str) -> Option<String> {
     if num_end > 0 {
         let rest = &t[num_end..];
         if rest.starts_with(". ") || rest.starts_with(") ") {
-            if rest.trim().is_empty() {
-                return None;
-            }
             let n: u64 = t[..num_end].parse().unwrap_or(1);
             let sep = &rest[..2];
             return Some(format!("{indent}{n}{sep}"));
@@ -3312,6 +3431,129 @@ impl Render for EditorView {
                 }))
         });
 
+        let palette_overlay = self.palette_open.then(|| {
+            const ROWS: usize = 9;
+            let entries = self.filtered_palette();
+            let start = self.palette_window.min(entries.len().saturating_sub(ROWS));
+            let visible: Vec<(usize, PaletteEntry)> = entries
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(ROWS)
+                .map(|(i, entry)| (i, *entry))
+                .collect();
+            let rows_el: Vec<AnyElement> = if visible.is_empty() {
+                vec![div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(13.0 * scale))
+                    .text_color(palette.muted)
+                    .child("No matching commands")
+                    .into_any_element()]
+            } else {
+                visible
+                    .into_iter()
+                    .map(|(index, entry)| {
+                        let selected = index == self.palette_index;
+                        div()
+                            .h(px(30.0 * scale))
+                            .px_3()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_3()
+                            .bg(if selected {
+                                palette.accent.opacity(0.22)
+                            } else {
+                                palette.bg
+                            })
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .text_size(px(13.0 * scale))
+                                    .child(entry.label),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0 * scale))
+                                    .text_color(palette.muted)
+                                    .child(entry.hint),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |v: &mut Self, _, w, cx| {
+                                    v.palette_index = index;
+                                    v.run_palette(w, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .into_any_element()
+                    })
+                    .collect()
+            };
+            let query_color = if self.palette_query.is_empty() {
+                palette.muted
+            } else {
+                palette.fg
+            };
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(96.0 * scale))
+                .bg(palette.bg.opacity(0.35))
+                .child(
+                    div()
+                        .w(px(540.0 * scale))
+                        .rounded(px(9.))
+                        .border_1()
+                        .border_color(palette.muted.opacity(0.35))
+                        .bg(palette.bg)
+                        .text_color(palette.fg)
+                        .overflow_hidden()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_: &mut Self, _, _, cx| cx.stop_propagation()),
+                        )
+                        .child(
+                            div()
+                                .h(px(40.0 * scale))
+                                .px_3()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .cursor_text()
+                                .text_size(px(14.0 * scale))
+                                .text_color(query_color)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .child(if self.palette_query.is_empty() {
+                                            "Type a command".to_string()
+                                        } else {
+                                            self.palette_query.clone()
+                                        })
+                                        .child(
+                                            div()
+                                                .ml(px(1.))
+                                                .w(px(1.5))
+                                                .h(px(16.0 * scale))
+                                                .bg(palette.fg.opacity(0.7)),
+                                        ),
+                                ),
+                        )
+                        .child(div().h(px(1.)).w_full().bg(palette.muted.opacity(0.3)))
+                        .child(div().flex().flex_col().children(rows_el)),
+                )
+        });
+
         let shortcuts_overlay = self.shortcuts_open.then(|| {
             const ROWS: &[(&str, &str)] = &[
                 ("Ctrl+S", "Save"),
@@ -3322,7 +3564,8 @@ impl Render for EditorView {
                 ("Ctrl+Z", "Undo"),
                 ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
                 ("F11 / Super+F", "Fullscreen"),
-                ("Ctrl+F / Ctrl+H", "Find"),
+                ("Ctrl+Shift+P", "Command Palette"),
+                ("Ctrl+F / Ctrl+H", "Find & Replace"),
                 ("Ctrl+Enter / Alt+Enter", "Replace All"),
                 ("Ctrl+G / Enter", "Next Match"),
                 ("Shift+Enter", "Previous Match"),
@@ -3794,14 +4037,18 @@ impl Render for EditorView {
                 cx.listener(|v: &mut Self, _: &SelectRight, _w, cx| v.move_horizontal(1, true, cx)),
             )
             .on_action(cx.listener(|v: &mut Self, _: &Up, w, cx| {
-                if v.font_open {
+                if v.palette_open {
+                    v.palette_move(-1, cx);
+                } else if v.font_open {
                     v.font_move(-1, cx);
                 } else {
                     v.move_vertical(-1, false, w, cx);
                 }
             }))
             .on_action(cx.listener(|v: &mut Self, _: &Down, w, cx| {
-                if v.font_open {
+                if v.palette_open {
+                    v.palette_move(1, cx);
+                } else if v.font_open {
                     v.font_move(1, cx);
                 } else {
                     v.move_vertical(1, false, w, cx);
@@ -3873,6 +4120,7 @@ impl Render for EditorView {
                 v.toggle_fullscreen(a, w, cx)
             }))
             .on_action(cx.listener(|v: &mut Self, a: &Shortcuts, w, cx| v.open_shortcuts(a, w, cx)))
+            .on_action(cx.listener(|v: &mut Self, _: &OpenPalette, w, cx| v.open_palette(w, cx)))
             .on_action(cx.listener(|v: &mut Self, _: &DialogCancel, w, cx| {
                 if v.close_prompt {
                     v.dialog_cancel(w, cx);
@@ -3999,6 +4247,7 @@ impl Render for EditorView {
                     )
                     .child(div().child(words)),
             )
+            .children(palette_overlay)
             .children(shortcuts_overlay)
             .children(font_overlay)
             .children(close_overlay)
@@ -4007,6 +4256,152 @@ impl Render for EditorView {
 }
 
 // ---------------- footer icons ----------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteCmd {
+    Save,
+    SaveAs,
+    Open,
+    NewWindow,
+    Export,
+    Find,
+    Replace,
+    Shortcuts,
+    Fullscreen,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ToggleVim,
+    FontPicker,
+    CopyHtml,
+    Bold,
+    Italic,
+    Strike,
+    Link,
+    Undo,
+    Redo,
+    SelectAll,
+}
+
+#[derive(Clone, Copy)]
+struct PaletteEntry {
+    label: &'static str,
+    hint: &'static str,
+    cmd: PaletteCmd,
+}
+
+const PALETTE: &[PaletteEntry] = &[
+    PaletteEntry {
+        label: "Save",
+        hint: "Ctrl+S",
+        cmd: PaletteCmd::Save,
+    },
+    PaletteEntry {
+        label: "Save As",
+        hint: "Ctrl+Shift+S",
+        cmd: PaletteCmd::SaveAs,
+    },
+    PaletteEntry {
+        label: "Open File",
+        hint: "Ctrl+O",
+        cmd: PaletteCmd::Open,
+    },
+    PaletteEntry {
+        label: "New Window",
+        hint: "Ctrl+N",
+        cmd: PaletteCmd::NewWindow,
+    },
+    PaletteEntry {
+        label: "Export PDF or HTML",
+        hint: "Ctrl+P",
+        cmd: PaletteCmd::Export,
+    },
+    PaletteEntry {
+        label: "Find",
+        hint: "Ctrl+F",
+        cmd: PaletteCmd::Find,
+    },
+    PaletteEntry {
+        label: "Find and Replace",
+        hint: "Ctrl+H",
+        cmd: PaletteCmd::Replace,
+    },
+    PaletteEntry {
+        label: "Keyboard Shortcuts",
+        hint: "F1",
+        cmd: PaletteCmd::Shortcuts,
+    },
+    PaletteEntry {
+        label: "Toggle Fullscreen",
+        hint: "F11",
+        cmd: PaletteCmd::Fullscreen,
+    },
+    PaletteEntry {
+        label: "Zoom In",
+        hint: "Ctrl+=",
+        cmd: PaletteCmd::ZoomIn,
+    },
+    PaletteEntry {
+        label: "Zoom Out",
+        hint: "Ctrl+-",
+        cmd: PaletteCmd::ZoomOut,
+    },
+    PaletteEntry {
+        label: "Reset Text Size",
+        hint: "Ctrl+0",
+        cmd: PaletteCmd::ZoomReset,
+    },
+    PaletteEntry {
+        label: "Toggle Vim Mode",
+        hint: "",
+        cmd: PaletteCmd::ToggleVim,
+    },
+    PaletteEntry {
+        label: "Change Font",
+        hint: "",
+        cmd: PaletteCmd::FontPicker,
+    },
+    PaletteEntry {
+        label: "Copy as HTML",
+        hint: "Ctrl+Shift+C",
+        cmd: PaletteCmd::CopyHtml,
+    },
+    PaletteEntry {
+        label: "Bold",
+        hint: "Ctrl+B",
+        cmd: PaletteCmd::Bold,
+    },
+    PaletteEntry {
+        label: "Italic",
+        hint: "Ctrl+I",
+        cmd: PaletteCmd::Italic,
+    },
+    PaletteEntry {
+        label: "Strikethrough",
+        hint: "Ctrl+Shift+X",
+        cmd: PaletteCmd::Strike,
+    },
+    PaletteEntry {
+        label: "Insert Link",
+        hint: "Ctrl+K",
+        cmd: PaletteCmd::Link,
+    },
+    PaletteEntry {
+        label: "Undo",
+        hint: "Ctrl+Z",
+        cmd: PaletteCmd::Undo,
+    },
+    PaletteEntry {
+        label: "Redo",
+        hint: "Ctrl+Shift+Z",
+        cmd: PaletteCmd::Redo,
+    },
+    PaletteEntry {
+        label: "Select All",
+        hint: "Ctrl+A",
+        cmd: PaletteCmd::SelectAll,
+    },
+];
 
 #[derive(Clone, Copy)]
 pub enum IconKind {
