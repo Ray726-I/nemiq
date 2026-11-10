@@ -1,5 +1,6 @@
 mod cli;
 mod editor_view;
+mod export;
 mod state;
 
 use clap::Parser;
@@ -10,6 +11,48 @@ use std::borrow::Cow;
 fn main() {
     let args = cli::Cli::parse();
     let file = args.file.clone();
+
+    if let Some(out) = args.export.clone() {
+        let Some(input) = file.clone() else {
+            eprintln!("--export needs an input file");
+            std::process::exit(2);
+        };
+        let text = match std::fs::read_to_string(&input) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Could not read {input}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let home = dirs::home_dir().unwrap_or_default();
+        let theme = nemiq_core::OmarchyTheme::load(&home, true);
+        let font = std::fs::read_to_string(
+            dirs::config_dir()
+                .unwrap_or_default()
+                .join("nemiq")
+                .join("font"),
+        )
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| nemiq_core::DEFAULT_EDITOR_FONT.to_string());
+        let title = std::path::Path::new(&input)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Nemiq".to_string());
+        match export::export_to(&text, std::path::Path::new(&out), &title, &theme, &font) {
+            Ok(()) => {
+                println!("Wrote {out}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("Export failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let vim = args.vim || crate::state::DocState::vim_pref();
 
     Application::new().run(move |cx: &mut App| {
         // Bundle the default typeface so the app looks right on any system.
@@ -76,6 +119,8 @@ fn main() {
             KeyBinding::new("ctrl-?", Shortcuts, Some("Editor")),
             KeyBinding::new("super-f", ToggleFullscreen, Some("Editor")),
             KeyBinding::new("shift-enter", FindPrev, Some("Editor")),
+            KeyBinding::new("ctrl-enter", ReplaceAll, Some("Editor")),
+            KeyBinding::new("alt-enter", ReplaceAll, Some("Editor")),
             KeyBinding::new("alt-c", DialogCancel, Some("Editor")),
             KeyBinding::new("alt-d", DialogDiscard, Some("Editor")),
             KeyBinding::new("alt-s", DialogSave, Some("Editor")),
@@ -94,7 +139,7 @@ fn main() {
                     ..Default::default()
                 },
                 |_, cx| {
-                    let view = cx.new(|cx| EditorView::new(cx));
+                    let view = cx.new(|cx| EditorView::new(vim, cx));
                     if let Some(f) = file.clone() {
                         view.update(cx, |v, _| {
                             v.state.open_or_start(std::path::Path::new(&f));

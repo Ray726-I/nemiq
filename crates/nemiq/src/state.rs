@@ -397,6 +397,18 @@ impl DocState {
         let _ = std::fs::write(config_path(), format!("{}", self.zoom.zoom));
         self.status = format!("Text size {}%", (self.zoom.zoom * 100.0).round() as i64);
     }
+    /// Whether vim-style modal editing is enabled, remembered across runs.
+    pub fn vim_pref() -> bool {
+        std::fs::read_to_string(vim_path())
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false)
+    }
+
+    pub fn save_vim_pref(&self, on: bool) {
+        let _ = std::fs::create_dir_all(config_dir());
+        let _ = std::fs::write(vim_path(), if on { "1" } else { "0" });
+    }
+
     pub fn text_scale(&self) -> f64 {
         self.desktop_scale * self.zoom.zoom
     }
@@ -412,6 +424,9 @@ fn config_path() -> PathBuf {
 }
 fn font_path() -> PathBuf {
     config_dir().join("font")
+}
+fn vim_path() -> PathBuf {
+    config_dir().join("vim")
 }
 fn window_path() -> PathBuf {
     config_dir().join("window")

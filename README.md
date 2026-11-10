@@ -27,8 +27,16 @@ else is a keyboard shortcut away.
   selected, Tab and Shift+Tab indent and outdent whole lines.
 - Font picker with a filter field, every usable family drawn in its own face,
   and a check mark on the current choice.
+- Find and replace: `Ctrl+H` adds a replace field, with Replace and Replace
+  All (a single undo step).
 - Copy the whole document as HTML (`Ctrl+Shift+C`), with a real `text/html`
   clipboard entry when `wl-copy` is available.
+- Export to PDF or HTML with the current theme and the bundled typeface, from
+  the window (`Ctrl+P`) or the command line (`--export`).
+- Optional vim-style modal editing: Normal, Insert and Visual modes, motions,
+  operators (`d`, `c`, `y`), text objects (`iw`, `i"`, `i(`), counts, registers
+  with `p`/`P`, `u` and `Ctrl+r`, `/` search, `:` commands (`:w`, `:q`, `:wq`,
+  `:set vim`), a block caret and a mode label. Off unless you ask for it.
 
 ## Build
 
@@ -42,11 +50,16 @@ gracefully. A macOS build may therefore work, but it has not been tried.
 Windows is not supported — GPUI has no Windows backend.
 
 ```sh
-cargo run -p nemiq                 # empty document
-cargo run -p nemiq -- notes.md     # open (or start) a file
-cargo test -p nemiq-core           # text and document logic tests
-cargo build --release -p nemiq     # binary at target/release/nemiq
+cargo run -p nemiq                          # empty document
+cargo run -p nemiq -- notes.md              # open (or start) a file
+cargo run -p nemiq -- --vim notes.md        # modal editing
+cargo run -p nemiq -- --export out.pdf notes.md   # convert and exit
+cargo test -p nemiq-core                    # text and document logic tests
+cargo build --release -p nemiq              # binary at target/release/nemiq
 ```
+
+`--export` writes HTML for a `.html` target and PDF otherwise. PDF rendering
+uses a headless Chromium (`chromium` or `google-chrome`).
 
 The editor bundles IBM Plex Mono (`fonts/`, SIL OFL 1.1) so it looks the same
 on any machine.
@@ -59,9 +72,12 @@ on any machine.
 | `Ctrl+O` | Open a file |
 | `Ctrl+N` | New window |
 | `Ctrl+Z`, `Ctrl+Shift+Z`, `Ctrl+Y` | Undo, redo |
-| `Ctrl+F`, `Ctrl+H` | Find in document |
+| `Ctrl+F`, `Ctrl+H` | Find, or find and replace |
 | `Ctrl+G` | Next match |
 | `Enter` / `Shift+Enter` in find | Next / previous match |
+| `Tab` in replace | Switch between the find and replace fields |
+| `Ctrl+Enter`, `Alt+Enter` | Replace all |
+| `Ctrl+P` | Export as PDF or HTML |
 | `Esc` | Close find, dialog or picker |
 | `Ctrl+=`, `Ctrl+-`, `Ctrl+0` | Zoom in, out, reset |
 | `Ctrl` + wheel | Zoom |
@@ -74,15 +90,16 @@ on any machine.
 | `F1`, `Ctrl+/`, `Ctrl+?` | Shortcut list |
 | `F11`, `Super+F` | Toggle fullscreen |
 
-## Not there yet
+## Vim mode
 
-- Printing: `Ctrl+P` only reports that printing is unavailable.
-- Find and replace: the bar searches the document, there is no replace field.
+Run `nemiq --vim file.md`, or `:set vim` in the `:` line to turn it on and
+remember the choice (`:set novim` turns it back off). Insert mode behaves
+exactly like the normal editor, so input methods and normal typing keep working.
 
 ## What is stored where
 
-- `~/.config/nemiq/zoom`, `font`, `window` — remembered text size, editor font
-  and window rectangle.
+- `~/.config/nemiq/zoom`, `font`, `window`, `vim` — remembered text size,
+  editor font, window rectangle and whether modal editing is on.
 - `~/.local/share/nemiq/recovery.json` — snapshot of unsaved work, written
   while you type and removed on a clean save or exit.
 - `~/.local/state/omarchy/current/theme/colors.toml` — read for colours on
@@ -93,13 +110,14 @@ on any machine.
 
 - `crates/nemiq-core/` — pure text logic, no UI dependencies: `document`
   (`Buffer`, `EditCommand`, undo), `markdown` (inline and fence scanning),
-  `mutations`, `search`, `wordcount`, `files`, `zoom`, `theme`, `fonts`.
+  `mutations`, `search`, `wordcount`, `files`, `zoom`, `theme`, `fonts`, and
+  `vim` (the modal state machine).
   Regexes compile once and prose lines are cheap-rejected before any matching.
 
 - `crates/nemiq/` — the GPUI app: `main.rs` (CLI, keymap, bundled fonts,
   window), `state.rs` (file, autosave, recovery, external-change state) and
   `editor_view.rs` (shaped text, input, painting, search bar, font picker,
-  dialogs). Lines that did not change keep their shaped output, so typing in a
+  dialogs) and `export.rs` (HTML/PDF). Lines that did not change keep their shaped output, so typing in a
   long document only re-shapes what actually moved.
 - `fonts/` — IBM Plex Mono with its OFL license.
 - `licenses/` — Apache-2.0 and MPL-2.0 texts from dependencies, plus the MIT

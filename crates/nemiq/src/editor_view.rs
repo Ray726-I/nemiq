@@ -10,7 +10,10 @@
 
 use crate::state::DocState;
 use gpui::*;
-use nemiq_core::{inline_markup, is_thematic_break, opening_fence_length, InlineKind};
+use nemiq_core::{
+    inline_markup, is_thematic_break, opening_fence_length, InlineKind, VimCommand, VimKey,
+    VimMode, VimState,
+};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +35,7 @@ actions!(
         FindReplace,
         FindNext,
         FindPrev,
+        ReplaceAll,
         CloseFind,
         ZoomIn,
         ZoomOut,
@@ -280,6 +284,8 @@ pub struct EditorView {
     pub search_open: bool,
     pub search_text: String,
     pub replace_open: bool,
+    replace_text: String,
+    replace_focus: bool,
     pub matches: Vec<usize>,
     pub match_idx: i32,
     revision: u64,
@@ -299,13 +305,17 @@ pub struct EditorView {
     font_names: Vec<String>,
     /// Which unsaved-changes button has keyboard focus (0 cancel, 1 discard, 2 save).
     pub close_focus: usize,
+    pub vim_enabled: bool,
+    vim: VimState,
+    pub cmdline_open: bool,
+    cmdline_text: String,
 }
 
 /// Rows visible in the font picker before it scrolls.
 const FONT_ROWS: usize = 10;
 
 impl EditorView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(vim_enabled: bool, cx: &mut Context<Self>) -> Self {
         let font_names = nemiq_core::selectable_font_families(&cx.text_system().all_font_names());
         let watcher = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -347,6 +357,8 @@ impl EditorView {
             search_open: false,
             search_text: String::new(),
             replace_open: false,
+            replace_text: String::new(),
+            replace_focus: false,
             matches: vec![],
             match_idx: -1,
             revision: 0,
@@ -363,6 +375,14 @@ impl EditorView {
             font_window: 0,
             font_names,
             close_focus: 2,
+            vim_enabled,
+            vim: if vim_enabled {
+                VimState::with_mode(VimMode::Normal)
+            } else {
+                VimState::new()
+            },
+            cmdline_open: false,
+            cmdline_text: String::new(),
         }
     }
 
@@ -371,12 +391,27 @@ impl EditorView {
     }
 
     fn modal_open(&self) -> bool {
-        self.search_open
+        self.cmdline_open
+            || self.search_open
             || self.font_open
             || self.shortcuts_open
             || self.close_prompt
             || self.pending_external.is_some()
     }
+    /// True while vim Normal/Visual owns the keyboard.
+    fn vim_blocks(&self) -> bool {
+        self.vim_enabled && self.vim.is_normal()
+    }
+
+    pub fn vim_mode(&self) -> VimMode {
+        self.vim.mode
+    }
+
+    /// Height of the `:` line, when open.
+    fn cmdline_height(&self) -> Pixels {
+        px(32.0 * self.state.text_scale() as f32)
+    }
+
     fn chars(&self) -> Vec<char> {
         self.text().chars().collect()
     }
@@ -405,11 +440,15 @@ impl EditorView {
     }
 
     fn find_bar_height(&self) -> Pixels {
+        let mut h = Pixels::ZERO;
         if self.search_open {
-            px(32.0 * self.state.text_scale() as f32)
-        } else {
-            Pixels::ZERO
+            let rows = if self.replace_open { 2.0 } else { 1.0 };
+            h += px(32.0 * self.state.text_scale() as f32 * rows);
         }
+        if self.cmdline_open {
+            h += self.cmdline_height();
+        }
+        h
     }
 
     /// Height of the editor element (viewport minus footer and find bar).
@@ -692,7 +731,7 @@ impl EditorView {
     }
 
     fn replace(&mut self, start: usize, end: usize, text: String, cx: &mut Context<Self>) {
-        if self.modal_open() {
+        if self.modal_open() || self.vim_blocks() {
             return;
         }
         let caret = self.state.apply_replace(start, end, text);
@@ -706,12 +745,26 @@ impl EditorView {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cmdline_open {
+            self.cmdline_text.pop();
+            cx.notify();
+            return;
+        }
         if self.font_open {
             self.font_filter_backspace(cx);
             return;
         }
+        if self.vim_blocks() {
+            self.vim_key_apply(VimKey::Backspace, window, cx);
+            return;
+        }
         if self.search_open {
-            self.search_backspace_impl(cx);
+            if self.replace_open && self.replace_focus {
+                self.replace_text.pop();
+                cx.notify();
+            } else {
+                self.search_backspace_impl(cx);
+            }
             return;
         }
         let (a, b) = self.sel();
@@ -730,7 +783,22 @@ impl EditorView {
             return;
         }
         if self.search_open {
-            self.search_word_backspace(cx);
+            if self.replace_open && self.replace_focus {
+                let mut chars: Vec<char> = self.replace_text.chars().collect();
+                while chars.last().is_some_and(|c| c.is_whitespace()) {
+                    chars.pop();
+                }
+                while chars
+                    .last()
+                    .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+                {
+                    chars.pop();
+                }
+                self.replace_text = chars.into_iter().collect();
+                cx.notify();
+            } else {
+                self.search_word_backspace(cx);
+            }
             return;
         }
         if self.modal_open() {
@@ -797,7 +865,7 @@ impl EditorView {
     }
 
     fn move_to(&mut self, pos: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal_open() {
+        if self.modal_open() || self.vim_blocks() {
             return;
         }
         let pos = pos.min(self.state.buffer.len_chars());
@@ -810,7 +878,7 @@ impl EditorView {
     }
 
     fn move_horizontal(&mut self, dir: i32, extend: bool, cx: &mut Context<Self>) {
-        if self.modal_open() {
+        if self.modal_open() || self.vim_blocks() {
             return;
         }
         let (a, b) = self.sel();
@@ -835,6 +903,14 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim_blocks() {
+            let key = if dir < 0 { VimKey::Up } else { VimKey::Down };
+            self.vim_key_apply(key, window, cx);
+            return;
+        }
+        if self.modal_open() {
+            return;
+        }
         let layout = self.layout(window);
         let Some((line_ix, x)) = caret_x(&layout, self.cursor) else {
             return;
@@ -852,6 +928,10 @@ impl EditorView {
     }
 
     fn home(&mut self, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vim_blocks() {
+            self.vim_key_apply(VimKey::Home, window, cx);
+            return;
+        }
         let vp = window.viewport_size();
         let layout = self.layout(window);
         let _ = vp;
@@ -866,6 +946,10 @@ impl EditorView {
     }
 
     fn end(&mut self, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vim_blocks() {
+            self.vim_key_apply(VimKey::End, window, cx);
+            return;
+        }
         let layout = self.layout(window);
         let line_end = layout
             .lines
@@ -897,6 +981,10 @@ impl EditorView {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cmdline_open {
+            self.cmdline_execute(window, cx);
+            return;
+        }
         if self.close_prompt {
             self.activate_close_focus(window, cx);
             return;
@@ -905,8 +993,16 @@ impl EditorView {
             self.choose_current_font(cx);
             return;
         }
+        if self.vim_blocks() {
+            self.vim_key_apply(VimKey::Enter, window, cx);
+            return;
+        }
         if self.search_open {
-            self.goto_match(1, window, cx);
+            if self.replace_open && self.replace_focus {
+                self.search_replace_current(window, cx);
+            } else {
+                self.goto_match(1, window, cx);
+            }
             return;
         }
         let (a, b) = self.sel();
@@ -934,6 +1030,7 @@ impl EditorView {
             self.anchor = self.anchor.min(n);
             self.bump();
             self.refresh_search();
+            self.schedule_autosave(cx);
         }
         cx.notify();
     }
@@ -949,6 +1046,7 @@ impl EditorView {
             self.anchor = self.anchor.min(n);
             self.bump();
             self.refresh_search();
+            self.schedule_autosave(cx);
         }
         cx.notify();
     }
@@ -1084,13 +1182,48 @@ impl EditorView {
     }
 
     fn print_document(&mut self, _: &Print, _w: &mut Window, cx: &mut Context<Self>) {
-        self.state.status = "Printing is not available yet.".to_string();
+        let stem = self
+            .state
+            .file_name()
+            .trim_end_matches(".md")
+            .trim_end_matches(".markdown")
+            .to_string();
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}.pdf"))
+            .add_filter("PDF", &["pdf"])
+            .add_filter("HTML", &["html", "htm"])
+            .save_file()
+        else {
+            return;
+        };
+        let text = self.text();
+        let title = self.state.file_name();
+        let result = crate::export::export_to(
+            &text,
+            &path,
+            &title,
+            &self.state.theme,
+            &self.state.editor_font,
+        );
+        self.state.status = match result {
+            Ok(()) => format!(
+                "Exported {}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ),
+            Err(err) => format!("Export failed: {err}"),
+        };
         cx.notify();
     }
 
     fn new_window(&mut self, _: &NewWindow, _w: &mut Window, _cx: &mut Context<Self>) {
         if let Ok(exe) = std::env::current_exe() {
-            let _ = std::process::Command::new(exe).spawn();
+            let mut cmd = std::process::Command::new(exe);
+            if self.vim_enabled {
+                cmd.arg("--vim");
+            }
+            let _ = cmd.spawn();
         }
     }
 
@@ -1338,7 +1471,7 @@ impl EditorView {
         self.indent_lines(a, b, true, cx);
     }
     fn indent_lines(&mut self, a: usize, b: usize, outdent: bool, cx: &mut Context<Self>) {
-        if self.modal_open() {
+        if self.modal_open() || self.vim_blocks() {
             return;
         }
         let t = self.text();
@@ -1423,11 +1556,75 @@ impl EditorView {
     fn open_search(&mut self, replace: bool, cx: &mut Context<Self>) {
         self.search_open = true;
         self.replace_open = replace;
+        self.replace_focus = false;
         self.refresh_search();
         self.jump_to_first_match(cx);
         cx.notify();
     }
-    fn close_search(&mut self, _: &CloseFind, _w: &mut Window, cx: &mut Context<Self>) {
+
+    fn search_replace_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_text.is_empty() || self.matches.is_empty() || self.match_idx < 0 {
+            return;
+        }
+        let pos = self.matches[self.match_idx as usize];
+        let qlen = self.search_text.chars().count();
+        let caret = self
+            .state
+            .apply_replace(pos, pos + qlen, self.replace_text.clone());
+        let _ = caret;
+        self.refresh_search();
+        if self.matches.is_empty() {
+            self.match_idx = -1;
+        } else {
+            let next = self
+                .matches
+                .iter()
+                .position(|&m| m >= pos + self.replace_text.chars().count())
+                .unwrap_or(0);
+            self.match_idx = next as i32;
+            self.anchor = self.matches[next];
+            self.cursor = self.anchor + self.search_text.chars().count();
+        }
+        self.after_edit(cx);
+        self.ensure_cursor_visible(window, cx);
+        cx.notify();
+    }
+
+    fn search_replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_text.is_empty() || self.matches.is_empty() {
+            return;
+        }
+        let chars: Vec<char> = self.text().chars().collect();
+        let qlen = self.search_text.chars().count();
+        let mut out = String::new();
+        let mut last = 0usize;
+        for &m in &self.matches {
+            if m < last || m + qlen > chars.len() {
+                continue;
+            }
+            out.extend(chars[last..m].iter());
+            out.push_str(&self.replace_text);
+            last = m + qlen;
+        }
+        if last == 0 {
+            return;
+        }
+        out.extend(chars[last..].iter());
+        let total = chars.len();
+        self.state.apply_replace(0, total, out);
+        self.match_idx = -1;
+        self.refresh_search();
+        self.after_edit(cx);
+        self.ensure_cursor_visible(window, cx);
+        cx.notify();
+    }
+    fn close_search(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cmdline_open {
+            self.cmdline_open = false;
+            self.cmdline_text.clear();
+            cx.notify();
+            return;
+        }
         if self.close_prompt {
             self.close_prompt = false;
             cx.notify();
@@ -1439,11 +1636,27 @@ impl EditorView {
             cx.notify();
             return;
         }
-        self.search_open = false;
-        self.replace_open = false;
-        self.matches.clear();
-        self.match_idx = -1;
+        if self.search_open {
+            self.search_open = false;
+            self.replace_open = false;
+            self.replace_focus = false;
+            if !self.vim_enabled {
+                self.matches.clear();
+                self.match_idx = -1;
+            }
+            cx.notify();
+            return;
+        }
+        if self.vim_enabled {
+            self.vim_key_apply(VimKey::Esc, window, cx);
+        }
         cx.notify();
+    }
+
+    fn vim_key_apply(&mut self, key: VimKey, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.text();
+        let cmd = self.vim.handle(&text, self.cursor, self.anchor, key);
+        self.apply_vim(cmd, window, cx);
     }
 
     fn jump_to_first_match(&mut self, cx: &mut Context<Self>) {
@@ -1488,6 +1701,217 @@ impl EditorView {
         self.search_text.push_str(text);
         self.refresh_search();
         self.jump_to_first_match(cx);
+        cx.notify();
+    }
+
+    // ---------- vim ----------
+    fn vim_key(keystroke: &Keystroke) -> Option<VimKey> {
+        match keystroke.key.as_str() {
+            "escape" => Some(VimKey::Esc),
+            "enter" => Some(VimKey::Enter),
+            "backspace" => Some(VimKey::Backspace),
+            "space" => Some(VimKey::Space),
+            "tab" => Some(VimKey::Tab),
+            "left" => Some(VimKey::Left),
+            "right" => Some(VimKey::Right),
+            "up" => Some(VimKey::Up),
+            "down" => Some(VimKey::Down),
+            "home" => Some(VimKey::Home),
+            "end" => Some(VimKey::End),
+            "delete" => Some(VimKey::Delete),
+            "pageup" => Some(VimKey::PageUp),
+            "pagedown" => Some(VimKey::PageDown),
+            _ => {
+                let ch = keystroke
+                    .key_char
+                    .as_deref()
+                    .and_then(|s| s.chars().next())
+                    .or_else(|| {
+                        let mut chars = keystroke.key.chars();
+                        match (chars.next(), chars.next()) {
+                            (Some(c), None) => Some(c),
+                            _ => None,
+                        }
+                    })?;
+                Some(VimKey::Char(ch))
+            }
+        }
+    }
+
+    fn on_vim_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.vim_enabled || self.modal_open() {
+            return;
+        }
+        let ks = &event.keystroke;
+        let m = ks.modifiers;
+        if m.control || m.alt || m.platform || m.function {
+            if m.control && !m.alt && !m.platform && self.vim.is_normal() && ks.key == "r" {
+                self.redo(&Redo, window, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        let Some(key) = Self::vim_key(ks) else {
+            return;
+        };
+        let text = self.text();
+        let cmd = self.vim.handle(&text, self.cursor, self.anchor, key);
+        let handled = !matches!(cmd, VimCommand::None) || self.vim.is_normal();
+        self.apply_vim(cmd, window, cx);
+        if handled {
+            cx.stop_propagation();
+        }
+    }
+
+    fn apply_vim(&mut self, cmd: VimCommand, window: &mut Window, cx: &mut Context<Self>) {
+        match cmd {
+            VimCommand::None => {}
+            VimCommand::Move { pos, extend } => {
+                let pos = pos.min(self.state.buffer.len_chars());
+                self.cursor = pos;
+                if !extend {
+                    self.anchor = pos;
+                }
+                self.ensure_cursor_visible(window, cx);
+                cx.notify();
+            }
+            VimCommand::Mode { mode, pos, anchor } => {
+                self.vim.mode = mode;
+                let len = self.state.buffer.len_chars();
+                self.cursor = pos.min(len);
+                self.anchor = anchor.min(len);
+                self.ensure_cursor_visible(window, cx);
+                cx.notify();
+            }
+            VimCommand::Edit {
+                start,
+                end,
+                text,
+                pos,
+                anchor,
+            } => {
+                self.state.apply_replace(start, end, text);
+                let len = self.state.buffer.len_chars();
+                self.cursor = pos.min(len);
+                self.anchor = anchor.min(len);
+                self.after_edit(cx);
+                self.ensure_cursor_visible(window, cx);
+                cx.notify();
+            }
+            VimCommand::Yank {
+                start,
+                end,
+                linewise,
+            } => {
+                let t = self.text();
+                let yanked: String = t
+                    .chars()
+                    .skip(start)
+                    .take(end.saturating_sub(start))
+                    .collect();
+                cx.write_to_clipboard(ClipboardItem::new_string(yanked.clone()));
+                self.state.status = if linewise {
+                    format!("Yanked {} line(s)", yanked.matches('\n').count().max(1))
+                } else {
+                    format!("Yanked {}", yanked.chars().count())
+                };
+                if self.vim.is_visual() {
+                    self.vim.mode = VimMode::Normal;
+                    self.cursor = start;
+                    self.anchor = start;
+                }
+                cx.notify();
+            }
+            VimCommand::Search { .. } => {
+                self.search_open = true;
+                self.replace_open = false;
+                self.search_text.clear();
+                self.matches.clear();
+                self.match_idx = -1;
+                cx.notify();
+            }
+            VimCommand::SearchNext { forward } => {
+                self.goto_match(if forward { 1 } else { -1 }, window, cx)
+            }
+            VimCommand::CommandLine => {
+                self.cmdline_open = true;
+                self.cmdline_text.clear();
+                cx.notify();
+            }
+            VimCommand::Save => self.save(&Save, window, cx),
+            VimCommand::Quit { force } => self.vim_quit(force, window, cx),
+            VimCommand::SaveQuit => {
+                self.save(&Save, window, cx);
+                if !self.state.modified {
+                    self.vim_quit(true, window, cx);
+                }
+            }
+            VimCommand::Undo => self.undo(&Undo, window, cx),
+        }
+    }
+
+    fn vim_quit(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if force || !self.state.modified {
+            self.state.discard_recovery();
+            self.close_approved = true;
+            window.remove_window();
+            return;
+        }
+        self.close_prompt = true;
+        self.close_focus = 2;
+        cx.notify();
+    }
+
+    fn cmdline_execute(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.cmdline_text.trim().to_string();
+        self.cmdline_open = false;
+        self.cmdline_text.clear();
+        let mut parts = input.split_whitespace();
+        let cmd = parts.next().unwrap_or("");
+        match cmd {
+            "" => {}
+            "w" | "write" => self.save(&Save, window, cx),
+            "q" | "quit" => self.vim_quit(false, window, cx),
+            "q!" => self.vim_quit(true, window, cx),
+            "wq" | "x" => {
+                self.save(&Save, window, cx);
+                if !self.state.modified {
+                    self.vim_quit(true, window, cx);
+                }
+            }
+            "noh" | "nohlsearch" => {
+                self.search_open = false;
+                self.search_text.clear();
+                self.matches.clear();
+                self.match_idx = -1;
+                self.state.status = "Search cleared".to_string();
+            }
+            "e" | "edit" => {
+                if let Some(path) = self.state.file_path.clone() {
+                    self.state.open(&path);
+                    self.cursor = 0;
+                    self.anchor = 0;
+                    self.bump();
+                    self.refresh_search();
+                }
+            }
+            "set" => match parts.next() {
+                Some("vim") => {
+                    self.vim_enabled = true;
+                    self.vim = VimState::with_mode(VimMode::Normal);
+                    self.state.save_vim_pref(true);
+                    self.state.status = "Vim mode on".to_string();
+                }
+                Some("novim") => {
+                    self.vim_enabled = false;
+                    self.vim = VimState::new();
+                    self.state.save_vim_pref(false);
+                    self.state.status = "Vim mode off".to_string();
+                }
+                _ => self.state.status = "set: expected vim or novim".to_string(),
+            },
+            other => self.state.status = format!("Unknown command: :{other}"),
+        }
         cx.notify();
     }
 
@@ -1774,12 +2198,25 @@ impl EntityInputHandler for EditorView {
         if self.close_prompt || self.pending_external.is_some() {
             return;
         }
+        if self.cmdline_open {
+            self.cmdline_text.push_str(new_text);
+            cx.notify();
+            return;
+        }
         if self.font_open {
             self.font_filter_push(new_text, cx);
             return;
         }
         if self.search_open {
-            self.search_append(new_text, cx);
+            if self.replace_open && self.replace_focus {
+                self.replace_text.push_str(new_text);
+                cx.notify();
+            } else {
+                self.search_append(new_text, cx);
+            }
+            return;
+        }
+        if self.vim_blocks() {
             return;
         }
         if new_text.chars().all(|c| c == '\n' || c == '\r') && !new_text.is_empty() {
@@ -1797,6 +2234,9 @@ impl EntityInputHandler for EditorView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim_blocks() {
+            return;
+        }
         let (a, b) = range
             .map(|r| (self.from_utf16(r.start), self.from_utf16(r.end)))
             .unwrap_or_else(|| self.sel());
@@ -2314,6 +2754,7 @@ pub struct Prepaint {
     scroll: Pixels,
     focused: bool,
     scrollbar_alpha: f32,
+    vim_normal: bool,
 }
 
 impl Element for EditorElement {
@@ -2378,6 +2819,7 @@ impl Element for EditorElement {
             matches: view.matches.clone(),
             match_idx: view.match_idx,
             focused: view.focus.is_focused(_window),
+            vim_normal: view.vim_enabled && view.vim.is_normal(),
         }
     }
     fn paint(
@@ -2414,6 +2856,17 @@ impl Element for EditorElement {
                 Bounds::new(point(p.x0, top), size(p.layout.wrap_width, line.height)),
                 p.palette.code_bg,
             ));
+        }
+
+        // Text backgrounds (inline code, fence runs), below any selection.
+        for line in &p.layout.lines {
+            let top = p.y0 + line.top - p.scroll;
+            if top + line.height < bounds.top() || top > bounds.bottom() {
+                continue;
+            }
+            line.shaped
+                .paint_background(point(p.x0, top), lh, TextAlign::Left, None, window, cx)
+                .ok();
         }
 
         // Selection
@@ -2497,9 +2950,6 @@ impl Element for EditorElement {
                 break;
             }
             line.shaped
-                .paint_background(point(p.x0, top), lh, TextAlign::Left, None, window, cx)
-                .ok();
-            line.shaped
                 .paint(point(p.x0, top), lh, TextAlign::Left, None, window, cx)
                 .ok();
         }
@@ -2515,10 +2965,18 @@ impl Element for EditorElement {
                         lh,
                     );
                 if y + lh >= bounds.top() && y <= bounds.bottom() {
-                    window.paint_quad(fill(
-                        Bounds::new(point(p.x0 + x, y), size(px(1.4), lh)),
-                        p.palette.fg,
-                    ));
+                    if p.vim_normal {
+                        // Block caret while Normal/Visual mode owns the keys.
+                        window.paint_quad(fill(
+                            Bounds::new(point(p.x0 + x, y), size(p.layout.font_size * 0.62, lh)),
+                            p.palette.fg.opacity(0.35),
+                        ));
+                    } else {
+                        window.paint_quad(fill(
+                            Bounds::new(point(p.x0 + x, y), size(px(1.4), lh)),
+                            p.palette.fg,
+                        ));
+                    }
                 }
             }
         }
@@ -2673,8 +3131,47 @@ impl Render for EditorView {
         );
 
         let scale = self.state.text_scale() as f32;
+        let vim_badge = if self.vim_enabled {
+            let label = match self.vim.mode {
+                VimMode::Insert => "INSERT",
+                VimMode::Normal => "NORMAL",
+                VimMode::Visual => {
+                    if self.vim.visual_line() {
+                        "VISUAL LINE"
+                    } else {
+                        "VISUAL"
+                    }
+                }
+                VimMode::Command => "COMMAND",
+            };
+            Some(div().text_color(palette.accent).child(label))
+        } else {
+            None
+        };
+        let cmdline_bar = self.cmdline_open.then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(self.cmdline_height())
+                .px_3()
+                .gap_2()
+                .border_t_1()
+                .border_color(palette.muted.opacity(0.25))
+                .text_size(px(13.0 * scale))
+                .text_color(palette.fg)
+                .cursor_text()
+                .child(div().text_color(palette.muted).child(":"))
+                .child(div().child(self.cmdline_text.clone()))
+                .child(
+                    div()
+                        .w(px(1.5))
+                        .h(px(16.0 * scale))
+                        .bg(palette.fg.opacity(0.7)),
+                )
+        });
         let search_bar = self.search_open.then(|| {
-            let matches = if self.matches.is_empty() {
+            let count = if self.matches.is_empty() {
                 "0/0".to_string()
             } else {
                 format!("{}/{}", self.match_idx + 1, self.matches.len())
@@ -2689,44 +3186,130 @@ impl Render for EditorView {
             } else {
                 palette.fg
             };
+            let replace_label = if self.replace_text.is_empty() {
+                "Replace".to_string()
+            } else {
+                self.replace_text.clone()
+            };
+            let replace_color = if self.replace_focus {
+                palette.fg
+            } else {
+                palette.muted
+            };
+            let row = px(32.0 * scale);
             div()
                 .flex()
-                .flex_row()
-                .items_center()
-                .h(px(32.0 * scale))
-                .px_3()
-                .gap_3()
+                .flex_col()
                 .border_t_1()
                 .border_color(palette.muted.opacity(0.25))
-                .text_size(px(13.0 * scale))
-                .text_color(palette.muted)
                 .child(
                     div()
-                        .flex_1()
-                        .cursor_text()
-                        .text_color(label_color)
-                        .child(label),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .h(row)
+                        .px_3()
+                        .gap_3()
+                        .text_size(px(13.0 * scale))
+                        .text_color(palette.muted)
+                        .child(
+                            div()
+                                .flex_1()
+                                .cursor_text()
+                                .text_color(label_color)
+                                .child(label)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|v: &mut Self, _, _, cx| {
+                                        v.replace_focus = false;
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .child(div().child(count))
+                        .child(div().cursor_pointer().px_1().child("↑").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|v: &mut Self, _, w, cx| {
+                                v.goto_match(-1, w, cx);
+                                cx.stop_propagation();
+                            }),
+                        ))
+                        .child(div().cursor_pointer().px_1().child("↓").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|v: &mut Self, _, w, cx| {
+                                v.goto_match(1, w, cx);
+                                cx.stop_propagation();
+                            }),
+                        ))
+                        .child(div().cursor_pointer().px_1().child("×").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|v: &mut Self, _, _, cx| {
+                                v.search_open = false;
+                                v.replace_open = false;
+                                v.replace_focus = false;
+                                v.matches.clear();
+                                v.match_idx = -1;
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )),
                 )
-                .child(div().child(matches))
-                .child(div().cursor_pointer().px_1().child("↑").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|v: &mut Self, _, w, cx| v.goto_match(-1, w, cx)),
-                ))
-                .child(div().cursor_pointer().px_1().child("↓").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|v: &mut Self, _, w, cx| v.goto_match(1, w, cx)),
-                ))
-                .child(div().cursor_pointer().px_1().child("×").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|v: &mut Self, _, w, cx| {
-                        let _ = w;
-                        v.search_open = false;
-                        v.replace_open = false;
-                        v.matches.clear();
-                        v.match_idx = -1;
-                        cx.notify();
-                    }),
-                ))
+                .children(self.replace_open.then(|| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .h(row)
+                        .px_3()
+                        .gap_3()
+                        .border_t_1()
+                        .border_color(palette.muted.opacity(0.15))
+                        .text_size(px(13.0 * scale))
+                        .child(
+                            div()
+                                .flex_1()
+                                .cursor_text()
+                                .text_color(replace_color)
+                                .child(replace_label)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|v: &mut Self, _, _, cx| {
+                                        v.replace_focus = true;
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .cursor_pointer()
+                                .px_1()
+                                .text_color(palette.fg)
+                                .child("Replace")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|v: &mut Self, _, w, cx| {
+                                        v.search_replace_current(w, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .cursor_pointer()
+                                .px_1()
+                                .text_color(palette.fg)
+                                .child("All")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|v: &mut Self, _, w, cx| {
+                                        v.search_replace_all(w, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
+                }))
         });
 
         let shortcuts_overlay = self.shortcuts_open.then(|| {
@@ -2735,11 +3318,12 @@ impl Render for EditorView {
                 ("Ctrl+Shift+S", "Save As"),
                 ("Ctrl+O", "Open"),
                 ("Ctrl+N", "New Window"),
-                ("Ctrl+P", "Print"),
+                ("Ctrl+P", "Export PDF / HTML"),
                 ("Ctrl+Z", "Undo"),
                 ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
                 ("F11 / Super+F", "Fullscreen"),
                 ("Ctrl+F / Ctrl+H", "Find"),
+                ("Ctrl+Enter / Alt+Enter", "Replace All"),
                 ("Ctrl+G / Enter", "Next Match"),
                 ("Shift+Enter", "Previous Match"),
                 ("Escape", "Close Find"),
@@ -3188,12 +3772,20 @@ impl Render for EditorView {
             )
             .on_action(cx.listener(|v: &mut Self, a: &WordDelete, w, cx| v.word_delete(a, w, cx)))
             .on_action(cx.listener(|v: &mut Self, _: &Left, w, cx| {
-                v.move_horizontal(-1, false, cx);
-                v.ensure_cursor_visible(w, cx);
+                if v.vim_blocks() {
+                    v.vim_key_apply(VimKey::Left, w, cx);
+                } else {
+                    v.move_horizontal(-1, false, cx);
+                    v.ensure_cursor_visible(w, cx);
+                }
             }))
             .on_action(cx.listener(|v: &mut Self, _: &Right, w, cx| {
-                v.move_horizontal(1, false, cx);
-                v.ensure_cursor_visible(w, cx);
+                if v.vim_blocks() {
+                    v.vim_key_apply(VimKey::Right, w, cx);
+                } else {
+                    v.move_horizontal(1, false, cx);
+                    v.ensure_cursor_visible(w, cx);
+                }
             }))
             .on_action(
                 cx.listener(|v: &mut Self, _: &SelectLeft, _w, cx| v.move_horizontal(-1, true, cx)),
@@ -3241,6 +3833,9 @@ impl Render for EditorView {
                     v.cycle_close_focus(1, cx);
                 } else if v.font_open {
                     v.font_move(1, cx);
+                } else if v.search_open && v.replace_open {
+                    v.replace_focus = !v.replace_focus;
+                    cx.notify();
                 } else {
                     v.indent(a, w, cx);
                 }
@@ -3262,6 +3857,11 @@ impl Render for EditorView {
             .on_action(cx.listener(|v: &mut Self, _: &Find, _, cx| v.open_search(false, cx)))
             .on_action(cx.listener(|v: &mut Self, _: &FindReplace, _, cx| v.open_search(true, cx)))
             .on_action(cx.listener(|v: &mut Self, _: &FindNext, w, cx| v.goto_match(1, w, cx)))
+            .on_action(cx.listener(|v: &mut Self, _: &ReplaceAll, w, cx| {
+                if v.search_open && v.replace_open {
+                    v.search_replace_all(w, cx);
+                }
+            }))
             .on_action(cx.listener(|v: &mut Self, _: &FindPrev, w, cx| v.goto_match(-1, w, cx)))
             .on_action(cx.listener(|v: &mut Self, a: &CloseFind, w, cx| v.close_search(a, w, cx)))
             .on_action(cx.listener(|v: &mut Self, a: &ZoomIn, w, cx| v.zoom_in(a, w, cx)))
@@ -3288,6 +3888,7 @@ impl Render for EditorView {
                     v.dialog_save(w, cx);
                 }
             }))
+            .on_key_down(cx.listener(|v: &mut Self, e, w, cx| v.on_vim_key(e, w, cx)))
             // mouse
             .on_mouse_down(
                 MouseButton::Left,
@@ -3313,6 +3914,7 @@ impl Render for EditorView {
                     .child(EditorElement { view: cx.entity() }),
             )
             .children(search_bar)
+            .children(cmdline_bar)
             .child(
                 div()
                     .flex()
@@ -3392,7 +3994,8 @@ impl Render for EditorView {
                                         }),
                                     ),
                             )
-                            .child(div().child(status)),
+                            .child(div().child(status))
+                            .children(vim_badge),
                     )
                     .child(div().child(words)),
             )

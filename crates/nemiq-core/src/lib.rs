@@ -5,6 +5,7 @@ pub mod markdown;
 pub mod mutations;
 pub mod search;
 pub mod theme;
+pub mod vim;
 pub mod wordcount;
 pub mod zoom;
 
@@ -17,5 +18,6 @@ pub use markdown::{
 };
 pub use search::find_matches;
 pub use theme::OmarchyTheme;
+pub use vim::{Command as VimCommand, Key as VimKey, VimState};
 pub use wordcount::count_words;
 pub use zoom::Zoom;
