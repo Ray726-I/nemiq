@@ -11,9 +11,14 @@ else is a keyboard shortcut away.
 ## Features
 
 - Centered 65-character writing column at 140% line height. Long lines wrap.
-- Live Markdown styling: headings, bold, italic, strikethrough, inline code,
-  fenced code blocks, links, quotes, lists and thematic breaks. Markup markers
-  are hidden unless the caret is in or against them.
+- Live Markdown preview: headings scale up (h1 to h6) and drop their `#`
+  markers, list and quote markers disappear, thematic breaks become rules, and
+  fenced code blocks lose their fence lines. Put the caret on a line and it
+  shows its raw Markdown again for editing.
+- Tables align into columns with the pipes hidden and the separator turned into
+  a rule, unless the caret is inside the table, where the source stays visible.
+- Styling for bold, italic, strikethrough, inline code, links, quotes and
+  lists; inline markers reappear when the caret is in or against them.
 - Theme colours from Omarchy's `colors.toml` (background, foreground, accent,
   selection, code panels), including the fallback mixing used when a theme
   leaves a value out.

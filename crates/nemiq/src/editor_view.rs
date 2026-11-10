@@ -157,6 +157,7 @@ struct LineBox {
     shaped: WrappedLine,
     top: Pixels,
     height: Pixels,
+    line_height: Pixels,
     fence: bool,
     /// display char -> local document char
     disp_to_doc: Vec<usize>,
@@ -166,6 +167,8 @@ struct LineBox {
     src: String,
     /// Caret offset within this line, if it was here when built.
     caret_local: Option<usize>,
+    /// 0 normal, 1 aligned table row, 2 table rule, 3 collapsed fence marker.
+    mode: u8,
 }
 
 impl LineBox {
@@ -578,6 +581,23 @@ impl EditorView {
         let prev = prev.filter(|p| p.palette_key == palette_key);
         let line_height = font_size * 1.4;
         let fences = fence_states(&text);
+        let source: Vec<&str> = text.split('\n').collect();
+        let caret_line = {
+            let mut pos = 0usize;
+            let mut found = 0usize;
+            for (i, l) in source.iter().enumerate() {
+                let len = l.chars().count();
+                if self.cursor <= pos + len {
+                    found = i;
+                    break;
+                }
+                pos += len + 1;
+                found = i;
+            }
+            found
+        };
+        let tables = table_lines(&source, caret_line, &fences);
+        let fence_blocks = fence_blocks(&source);
         let mut lines = Vec::new();
         let mut top = Pixels::ZERO;
         let mut start_char = 0usize;
@@ -587,11 +607,32 @@ impl EditorView {
             let char_len = line.chars().count();
             let caret_local = (self.cursor >= line_start && self.cursor <= line_start + char_len)
                 .then(|| self.cursor - line_start);
+            let table = tables.get(i).and_then(|t| t.as_ref());
+            let in_fence_block = fence_blocks
+                .iter()
+                .find(|&&(a, b)| i >= a && i <= b)
+                .is_some_and(|&(a, b)| caret_line >= a && caret_line <= b);
+            let collapse = is_fence_delimiter(line) && !in_fence_block;
+            let mode = if collapse {
+                3
+            } else if table.is_some() {
+                if table.is_some_and(|t| t.separator) {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                0
+            };
 
             // Unchanged line: reuse its shaped text and display map. This keeps
             // typing O(1) in document size.
             if let Some(old) = prev.and_then(|p| p.lines.get(i)) {
-                if old.src == line && old.fence == fence && old.caret_local == caret_local {
+                if old.src == line
+                    && old.fence == fence
+                    && old.caret_local == caret_local
+                    && old.mode == mode
+                {
                     lines.push(LineBox {
                         start_char: line_start,
                         top,
@@ -606,16 +647,30 @@ impl EditorView {
             }
 
             let styles = line_styles(line, &palette, fence);
-            let (display, disp_to_doc, doc_to_disp) =
-                build_display(line, fence, line_start, self.cursor);
+            let level = if caret_local.is_none() {
+                heading_level(line)
+            } else {
+                0
+            };
+            let size = font_size * heading_scale(level);
+            let lh = size * 1.4;
+            let (display, disp_to_doc, doc_to_disp) = if collapse {
+                (Vec::new(), Vec::new(), vec![usize::MAX; char_len])
+            } else {
+                build_display(line, fence, line_start, self.cursor, table)
+            };
             let mut display_styles: Vec<CharStyle> = Vec::with_capacity(display.len());
+            let rule = mode == 2;
             for &doc in &disp_to_doc {
-                display_styles.push(
-                    styles
-                        .get(doc)
-                        .cloned()
-                        .unwrap_or_else(|| normal_style(&palette)),
-                );
+                let mut style = styles
+                    .get(doc)
+                    .cloned()
+                    .unwrap_or_else(|| normal_style(&palette));
+                if rule {
+                    style.color = palette.marker;
+                    style.bg = None;
+                }
+                display_styles.push(style);
             }
             let runs = styles_to_runs(&display, &display_styles, &palette);
             let shaped_line: SharedString = if display.is_empty() {
@@ -643,13 +698,14 @@ impl EditorView {
             };
             let shaped = window
                 .text_system()
-                .shape_text(shaped_line, font_size, &runs, Some(wrap_width), None)
+                .shape_text(shaped_line, size, &runs, Some(wrap_width), None)
                 .ok()
                 .and_then(|mut v| v.drain(..).next());
-            let height = shaped
-                .as_ref()
-                .map(|s| s.size(line_height).height)
-                .unwrap_or(line_height);
+            let height = if collapse {
+                px(6.0 * self.state.text_scale() as f32)
+            } else {
+                shaped.as_ref().map(|s| s.size(lh).height).unwrap_or(lh)
+            };
             let shaped = shaped.unwrap_or_default();
             lines.push(LineBox {
                 start_char: line_start,
@@ -657,11 +713,13 @@ impl EditorView {
                 shaped,
                 top,
                 height,
+                line_height: lh,
                 fence,
                 disp_to_doc,
                 doc_to_disp,
                 src: line.to_string(),
                 caret_local,
+                mode,
             });
             top += height;
             start_char += char_len + 1;
@@ -932,8 +990,8 @@ impl EditorView {
         let Some((line_ix, x)) = caret_x(&layout, self.cursor) else {
             return;
         };
-        let lh = layout.line_height;
         let line = &layout.lines[line_ix];
+        let lh = line.line_height;
         let local_row_y = caret_in_line_y(
             &line.shaped,
             line.display_col(self.cursor - line.start_char),
@@ -990,7 +1048,7 @@ impl EditorView {
             + caret_in_line_y(
                 &line.shaped,
                 line.display_col(self.cursor - line.start_char),
-                layout.line_height,
+                line.line_height,
             );
         let target_y = (y + view_h * dir as f32).max(px(0.));
         let target = index_for_layout_point(&layout, x, target_y);
@@ -2525,8 +2583,8 @@ fn word_bounds(text: &str, at: usize) -> (usize, usize) {
 fn caret_line_rect(layout: &Layout, cursor: usize) -> Option<(Pixels, Pixels)> {
     let line = layout.lines.iter().rev().find(|l| l.start_char <= cursor)?;
     let local = cursor - line.start_char;
-    let y = caret_in_line_y(&line.shaped, line.display_col(local), layout.line_height);
-    Some((line.top + y, layout.line_height))
+    let y = caret_in_line_y(&line.shaped, line.display_col(local), line.line_height);
+    Some((line.top + y, line.line_height))
 }
 
 fn caret_x(layout: &Layout, cursor: usize) -> Option<(usize, Pixels)> {
@@ -2534,7 +2592,7 @@ fn caret_x(layout: &Layout, cursor: usize) -> Option<(usize, Pixels)> {
         if cursor >= line.start_char && cursor <= line.start_char + line.char_len {
             let local = line.display_col(cursor - line.start_char);
             let byte = char_to_byte(line.shaped.text.as_ref(), local);
-            let p = line.shaped.position_for_index(byte, layout.line_height);
+            let p = line.shaped.position_for_index(byte, line.line_height);
             return Some((i, px(p.map(|p| f32::from(p.x)).unwrap_or(0.0))));
         }
     }
@@ -2555,7 +2613,7 @@ fn index_for_layout_point(layout: &Layout, x: Pixels, y: Pixels) -> usize {
             let local = point(x.max(px(0.)), (y - line.top).max(px(0.)));
             let byte = match line
                 .shaped
-                .closest_index_for_position(local, layout.line_height)
+                .closest_index_for_position(local, line.line_height)
             {
                 Ok(b) => b,
                 Err(b) => b,
@@ -2714,9 +2772,30 @@ fn build_display(
     fence: bool,
     line_start: usize,
     cursor: usize,
+    table: Option<&TableLine>,
 ) -> (Vec<char>, Vec<usize>, Vec<usize>) {
     let chars: Vec<char> = line.chars().collect();
+    if let Some(table) = table {
+        return table_display(&chars, table);
+    }
     let mut hide = vec![false; chars.len()];
+    let on_line = cursor >= line_start && cursor <= line_start + chars.len();
+    if !fence && !on_line {
+        if is_thematic_break(line) {
+            // A horizontal rule reads better than a row of dashes.
+            let width = 40usize;
+            return (
+                vec!['\u{2500}'; width],
+                vec![0; width],
+                vec![usize::MAX; chars.len()],
+            );
+        }
+        if let Some((start, end)) = structural_marker(&chars) {
+            for slot in hide.iter_mut().take(end.min(chars.len())).skip(start) {
+                *slot = true;
+            }
+        }
+    }
     if !fence {
         for m in inline_markup(line) {
             let start = m.markers[0].start;
@@ -2787,6 +2866,210 @@ fn styles_to_runs(display: &[char], styles: &[CharStyle], p: &Palette) -> Vec<Te
         i = j;
     }
     runs
+}
+
+/// One table row prepared for preview rendering.
+#[derive(Clone)]
+struct TableLine {
+    widths: Vec<usize>,
+    cells: Vec<(usize, usize)>,
+    separator: bool,
+}
+
+fn is_fence_delimiter(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("```") || t.starts_with("~~~")
+}
+
+fn fence_blocks(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if is_fence_delimiter(lines[i]) {
+            let start = i;
+            let mut j = i + 1;
+            while j < lines.len() && !is_fence_delimiter(lines[j]) {
+                j += 1;
+            }
+            let end = j.min(lines.len().saturating_sub(1));
+            out.push((start, end));
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn is_table_row(line: &str) -> bool {
+    line.contains('|') && !line.trim().is_empty()
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let mut dashes = 0;
+    for c in line.chars() {
+        match c {
+            '-' => dashes += 1,
+            '|' | ':' | ' ' | '\t' => {}
+            _ => return false,
+        }
+    }
+    dashes > 0 && line.contains('|')
+}
+
+/// Trimmed cell spans, ignoring the outer pipes.
+fn cell_spans(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi && chars[lo].is_whitespace() {
+        lo += 1;
+    }
+    while hi > lo && chars[hi - 1].is_whitespace() {
+        hi -= 1;
+    }
+    if lo < hi && chars[lo] == '|' {
+        lo += 1;
+    }
+    if hi > lo && chars[hi - 1] == '|' {
+        hi -= 1;
+    }
+    let mut spans = Vec::new();
+    let mut start = lo;
+    let mut i = lo;
+    while i <= hi {
+        if i == hi || chars[i] == '|' {
+            let mut s = start;
+            let mut e = i;
+            while s < e && chars[s].is_whitespace() {
+                s += 1;
+            }
+            while e > s && chars[e - 1].is_whitespace() {
+                e -= 1;
+            }
+            spans.push((s, e.min(chars.len())));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    spans
+}
+
+/// Prepare every line of a table block for aligned preview rendering. Lines
+/// outside a block, or any block the caret is inside, stay raw.
+fn table_lines(lines: &[&str], caret_line: usize, fences: &[bool]) -> Vec<Option<TableLine>> {
+    let mut out: Vec<Option<TableLine>> = vec![None; lines.len()];
+    let mut i = 0usize;
+    while i + 1 < lines.len() {
+        if !(is_table_row(lines[i]) && is_table_separator(lines[i + 1])) {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < lines.len() && is_table_row(lines[end]) {
+            end += 1;
+        }
+        if caret_line >= i && caret_line < end {
+            i = end;
+            continue;
+        }
+        if (i..end).any(|row| *fences.get(row).unwrap_or(&false)) {
+            i = end;
+            continue;
+        }
+        let mut widths: Vec<usize> = Vec::new();
+        let mut parsed: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+        for (row, line) in lines.iter().enumerate().take(end).skip(i) {
+            let chars: Vec<char> = line.chars().collect();
+            let spans = cell_spans(&chars);
+            for (col, &(s, e)) in spans.iter().enumerate() {
+                if col >= widths.len() {
+                    widths.resize(col + 1, 0);
+                }
+                widths[col] = widths[col].max(e.saturating_sub(s));
+            }
+            parsed.push((row, spans));
+        }
+        for (row, cells) in parsed {
+            out[row] = Some(TableLine {
+                widths: widths.clone(),
+                cells,
+                separator: row == i + 1,
+            });
+        }
+        i = end;
+    }
+    out
+}
+
+fn table_display(chars: &[char], table: &TableLine) -> (Vec<char>, Vec<usize>, Vec<usize>) {
+    let mut display: Vec<char> = Vec::new();
+    let mut disp_to_doc: Vec<usize> = Vec::new();
+    let mut doc_to_disp = vec![usize::MAX; chars.len()];
+    for (col, &(start, end)) in table.cells.iter().enumerate() {
+        if col > 0 {
+            let anchor = start.saturating_sub(1).min(chars.len().saturating_sub(1));
+            for _ in 0..2 {
+                display.push(' ');
+                disp_to_doc.push(anchor);
+            }
+        }
+        let width = table.widths.get(col).copied().unwrap_or(end - start);
+        if table.separator {
+            let anchor = start.min(chars.len().saturating_sub(1));
+            for _ in 0..width {
+                display.push('\u{2500}');
+                disp_to_doc.push(anchor);
+            }
+        } else {
+            for i in start..end {
+                doc_to_disp[i] = display.len();
+                display.push(chars[i]);
+                disp_to_doc.push(i);
+            }
+            let anchor = end.saturating_sub(1).min(chars.len().saturating_sub(1));
+            for _ in (end - start)..width {
+                display.push(' ');
+                disp_to_doc.push(anchor);
+            }
+        }
+    }
+    (display, disp_to_doc, doc_to_disp)
+}
+
+fn heading_level(line: &str) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.iter().take_while(|&&c| c == '#').count();
+    if (1..=6).contains(&n) && chars.get(n) == Some(&' ') {
+        n
+    } else {
+        0
+    }
+}
+
+fn heading_scale(level: usize) -> f32 {
+    match level {
+        1 => 1.75,
+        2 => 1.5,
+        3 => 1.28,
+        4 => 1.12,
+        5 => 1.03,
+        _ => 1.0,
+    }
+}
+
+/// Leading marker to hide while the caret is on another line.
+fn structural_marker(chars: &[char]) -> Option<(usize, usize)> {
+    if let Some(width) = heading_marker(chars) {
+        return Some((0, width));
+    }
+    if let Some((width, content)) = quote_marker(chars) {
+        return Some((content.saturating_sub(width), content));
+    }
+    if let Some(width) = list_marker(chars) {
+        let indent = chars.iter().take_while(|&&c| c == ' ').count();
+        return Some((indent, width));
+    }
+    None
 }
 
 fn heading_marker(chars: &[char]) -> Option<usize> {
@@ -2984,7 +3267,14 @@ impl Element for EditorElement {
                 continue;
             }
             line.shaped
-                .paint_background(point(p.x0, top), lh, TextAlign::Left, None, window, cx)
+                .paint_background(
+                    point(p.x0, top),
+                    line.line_height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                )
                 .ok();
         }
 
@@ -3014,7 +3304,7 @@ impl Element for EditorElement {
                     lb,
                     line.disp_to_doc.len(),
                     point(p.x0, top),
-                    lh,
+                    line.line_height,
                     p.layout.wrap_width,
                     p.palette.selection,
                 );
@@ -3051,7 +3341,7 @@ impl Element for EditorElement {
                         lb,
                         line.disp_to_doc.len(),
                         point(p.x0, top),
-                        lh,
+                        line.line_height,
                         p.layout.wrap_width,
                         color,
                     );
@@ -3069,7 +3359,14 @@ impl Element for EditorElement {
                 break;
             }
             line.shaped
-                .paint(point(p.x0, top), lh, TextAlign::Left, None, window, cx)
+                .paint(
+                    point(p.x0, top),
+                    line.line_height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                )
                 .ok();
         }
 
@@ -3077,6 +3374,7 @@ impl Element for EditorElement {
         if p.focused && sa == sb {
             if let Some((line_ix, x)) = caret_x(&p.layout, p.cursor) {
                 let line = &p.layout.lines[line_ix];
+                let lh = line.line_height;
                 let y = p.y0 + line.top - p.scroll
                     + caret_in_line_y(
                         &line.shaped,
