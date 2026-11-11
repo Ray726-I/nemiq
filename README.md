@@ -55,7 +55,8 @@ else is a keyboard shortcut away.
 - Optional vim-style modal editing: Normal, Insert and Visual modes, motions,
   operators (`d`, `c`, `y`), text objects (`iw`, `i"`, `i(`), counts, registers
   with `p`/`P`, `u` and `Ctrl+r`, `/` search, `:` commands (`:w`, `:q`, `:wq`,
-  `:set vim`), a block caret and a mode label. Off unless you ask for it.
+  `:set novim`, `:set number`), a block caret and a mode label. Off unless you
+  ask for it.
 
 ## Build
 
@@ -118,10 +119,10 @@ on any machine.
 ## Vim mode
 
 Run `nemiq --vim file.md`, or press `Ctrl+Shift+P` and choose **Toggle Vim
-Mode**; the choice is remembered for next time. Once vim mode is on, `:set vim`
-and `:set novim` do the same from the `:` line (the `:` line only exists inside
-vim mode). Insert mode behaves exactly like the normal editor, so input methods
-and normal typing keep working.
+Mode**; the choice is remembered for next time. To leave it, `:set novim` from
+the `:` line or the same palette entry — the `:` line only exists while vim mode
+is on, so it cannot be the way in. Insert mode behaves exactly like the normal
+editor, so input methods and normal typing keep working.
 
 `j` and `k` move down and up one *displayed* row, so wrapped paragraphs behave
 like real lines and counts work (`3j`). `yy`/`Y` yank that displayed row, and the
