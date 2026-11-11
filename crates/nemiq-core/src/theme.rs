@@ -150,3 +150,45 @@ impl OmarchyTheme {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reloads_when_the_generated_colours_change() {
+        let home = std::env::temp_dir().join(format!("nemiq-theme-{}", std::process::id()));
+        let dir = home.join(".local/state/omarchy/current/theme");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("colors.toml");
+
+        std::fs::write(
+            &path,
+            "mode = \"dark\"\nbackground = \"#101010\"\nforeground = \"#eeeeee\"\n",
+        )
+        .unwrap();
+        let dark = OmarchyTheme::load(&home, true);
+        assert!(dark.dark);
+        assert_eq!(dark.background, "#101010");
+
+        std::fs::write(
+            &path,
+            "mode = \"light\"\nbackground = \"#fdf6e3\"\nforeground = \"#073642\"\n",
+        )
+        .unwrap();
+        let light = OmarchyTheme::load(&home, true);
+        assert!(!light.dark);
+        assert_eq!(light.background, "#fdf6e3");
+        assert_ne!(dark, light);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The theme switch swaps a symlink, so the file is briefly missing.
+    #[test]
+    fn missing_file_falls_back_without_panicking() {
+        let missing = std::env::temp_dir().join("nemiq-theme-does-not-exist");
+        let theme = OmarchyTheme::load(&missing, true);
+        assert_eq!(theme.background, "#101010");
+    }
+}

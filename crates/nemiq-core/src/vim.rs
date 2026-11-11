@@ -32,6 +32,11 @@ pub enum Command {
         pos: usize,
         extend: bool,
     },
+    /// Move by display rows; the view owns wrapping, so it resolves this.
+    MoveVertical {
+        dir: i32,
+        count: usize,
+    },
     Mode {
         mode: VimMode,
         pos: usize,
@@ -50,6 +55,12 @@ pub enum Command {
         start: usize,
         end: usize,
         linewise: bool,
+    },
+    /// `yy`/`Y`: yank whole displayed rows. The view resolves the range,
+    /// because one source line can be several rows (and vice versa) when the
+    /// text is reflowed for display.
+    YankRow {
+        count: usize,
     },
     Search {
         forward: bool,
@@ -129,6 +140,12 @@ impl VimState {
 
     pub fn register(&self) -> &str {
         &self.register
+    }
+
+    /// The view owns display-row ranges, so it stores what it actually yanked.
+    pub fn set_register(&mut self, text: String, linewise: bool) {
+        self.register = text;
+        self.register_linewise = linewise;
     }
 
     pub fn is_normal(&self) -> bool {
@@ -298,12 +315,17 @@ impl VimState {
         };
 
         match ch {
-            'h' | 'j' | 'k' | 'l' | 'w' | 'b' | 'e' | '0' | '^' | '$' => {
+            'j' | 'k' => {
+                let n = self.take_count();
+                Command::MoveVertical {
+                    dir: if ch == 'j' { 1 } else { -1 },
+                    count: n,
+                }
+            }
+            'h' | 'l' | 'w' | 'b' | 'e' | '0' | '^' | '$' => {
                 let n = self.take_count();
                 let motion = match ch {
                     'h' => Motion::Left,
-                    'j' => Motion::Down,
-                    'k' => Motion::Up,
                     'l' => Motion::Right,
                     'w' => Motion::WordForward,
                     'b' => Motion::WordBack,
@@ -339,10 +361,13 @@ impl VimState {
                 self.pending = Pending::Op(op);
                 Command::None
             }
-            'D' | 'Y' => {
-                let op = if ch == 'D' { Op::Delete } else { Op::Yank };
+            'D' => {
                 let end = line_end(&c, cursor);
-                self.finish(op, &c, cursor, end, false, anchor)
+                self.finish(Op::Delete, &c, cursor, end, false, anchor)
+            }
+            'Y' => {
+                let count = self.take_count();
+                Command::YankRow { count }
             }
             'x' | 'X' => {
                 let n = self.take_count();
@@ -359,18 +384,25 @@ impl VimState {
                 Command::Undo
             }
             'v' | 'V' => {
-                let entering = self.mode != VimMode::Visual;
-                self.mode = if entering {
-                    VimMode::Visual
+                let want_line = ch == 'V';
+                let was_visual = self.mode == VimMode::Visual;
+                // `v`/`V` start visual mode. Inside it the same key leaves,
+                // while the other one switches between characterwise and
+                // linewise without dropping the selection, as in Vim.
+                let (mode, keep_anchor) = if !was_visual {
+                    (VimMode::Visual, false)
+                } else if want_line == self.visual_line {
+                    (VimMode::Normal, false)
                 } else {
-                    VimMode::Normal
+                    (VimMode::Visual, true)
                 };
-                self.visual_line = entering && ch == 'V';
+                self.mode = mode;
+                self.visual_line = mode == VimMode::Visual && want_line;
                 self.count = None;
                 Command::Mode {
-                    mode: self.mode,
+                    mode,
                     pos: cursor,
-                    anchor: if entering { cursor } else { cursor },
+                    anchor: if keep_anchor { anchor } else { cursor },
                 }
             }
             'J' => self.join_lines(&c, cursor),
@@ -398,8 +430,8 @@ impl VimState {
         let (motion, n) = match key {
             Key::Left => (Motion::Left, 1),
             Key::Right | Key::Space => (Motion::Right, 1),
-            Key::Up => (Motion::Up, 1),
-            Key::Down | Key::Enter => (Motion::Down, 1),
+            Key::Up => return Command::MoveVertical { dir: -1, count: 1 },
+            Key::Down | Key::Enter => return Command::MoveVertical { dir: 1, count: 1 },
             Key::Home => (Motion::LineStart, 1),
             Key::End => (Motion::LineEnd, 1),
             Key::PageUp | Key::PageDown => return Command::None,
@@ -435,6 +467,11 @@ impl VimState {
             (op, ch),
             (Op::Delete, 'd') | (Op::Change, 'c') | (Op::Yank, 'y')
         ) {
+            if op == Op::Yank {
+                return Command::YankRow {
+                    count: count.max(1),
+                };
+            }
             let (start, end) = linewise_range(c, cursor, count);
             return self.finish(op, c, start, end, true, anchor);
         }
@@ -1129,17 +1166,11 @@ mod tests {
         );
         assert_eq!(
             seq(text, 0, "j").1,
-            Command::Move {
-                pos: 6,
-                extend: false
-            }
+            Command::MoveVertical { dir: 1, count: 1 }
         );
         assert_eq!(
             seq(text, 6, "k").1,
-            Command::Move {
-                pos: 0,
-                extend: false
-            }
+            Command::MoveVertical { dir: -1, count: 1 }
         );
     }
 
@@ -1272,7 +1303,12 @@ mod tests {
         let text = "one\ntwo";
         let mut st = normal();
         st.handle(text, 0, 0, Key::Char('y'));
-        st.handle(text, 0, 0, Key::Char('y'));
+        // The view resolves the displayed row and stores what it yanked.
+        assert_eq!(
+            st.handle(text, 0, 0, Key::Char('y')),
+            Command::YankRow { count: 1 }
+        );
+        st.set_register("one\n".to_string(), true);
         let cmd = st.handle(text, 0, 0, Key::Char('p'));
         assert_eq!(
             cmd,
@@ -1320,6 +1356,13 @@ mod tests {
     }
 
     #[test]
+    fn yy_and_shift_y_ask_the_view_for_display_rows() {
+        assert_eq!(seq("one\ntwo", 0, "yy").1, Command::YankRow { count: 1 });
+        assert_eq!(seq("one\ntwo", 0, "2yy").1, Command::YankRow { count: 2 });
+        assert_eq!(seq("one\ntwo", 0, "Y").1, Command::YankRow { count: 1 });
+    }
+
+    #[test]
     fn visual_selection_yanks() {
         let mut st = normal();
         let cmd = st.handle("hello world", 0, 0, Key::Char('v'));
@@ -1353,6 +1396,45 @@ mod tests {
                 linewise: true
             }
         );
+    }
+
+    #[test]
+    fn v_then_shift_v_switches_to_linewise_and_keeps_the_anchor() {
+        let mut st = normal();
+        st.handle("one\ntwo\nthree", 0, 0, Key::Char('v'));
+        assert_eq!(
+            st.handle("one\ntwo\nthree", 1, 0, Key::Char('V')),
+            Command::Mode {
+                mode: VimMode::Visual,
+                pos: 1,
+                anchor: 0
+            }
+        );
+        assert!(st.is_visual());
+        assert!(st.visual_line());
+        assert_eq!(
+            st.handle("one\ntwo\nthree", 1, 0, Key::Char('y')),
+            Command::Yank {
+                start: 0,
+                end: 4,
+                linewise: true
+            }
+        );
+    }
+
+    #[test]
+    fn shift_v_twice_leaves_visual_mode() {
+        let mut st = normal();
+        st.handle("one\ntwo", 0, 0, Key::Char('V'));
+        assert_eq!(
+            st.handle("one\ntwo", 0, 0, Key::Char('V')),
+            Command::Mode {
+                mode: VimMode::Normal,
+                pos: 0,
+                anchor: 0
+            }
+        );
+        assert!(!st.is_visual());
     }
 
     #[test]

@@ -171,6 +171,50 @@ impl Buffer {
             }
         }
     }
+    /// Start of the word to the left of `offset` (Ctrl+Left).
+    pub fn word_start_left(&self, offset: usize) -> usize {
+        let s = self.text();
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = offset.min(chars.len());
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        if i == 0 {
+            return 0;
+        }
+        let word = word_char(chars[i - 1]);
+        while i > 0 {
+            let c = chars[i - 1];
+            if c.is_whitespace() || word_char(c) != word {
+                break;
+            }
+            i -= 1;
+        }
+        i
+    }
+
+    /// End of the word to the right of `offset` (Ctrl+Right).
+    pub fn word_end_right(&self, offset: usize) -> usize {
+        let s = self.text();
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = offset.min(chars.len());
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            return chars.len();
+        }
+        let word = word_char(chars[i]);
+        while i < chars.len() {
+            let c = chars[i];
+            if c.is_whitespace() || word_char(c) != word {
+                break;
+            }
+            i += 1;
+        }
+        i
+    }
+
     /// Move one grapheme cluster, so combining marks and emoji stay whole.
     pub fn step_grapheme(&self, offset: usize, dir: i32) -> usize {
         let s = self.text();
@@ -190,6 +234,12 @@ impl Buffer {
     }
 }
 
+/// What Ctrl+Left/Right treats as a single word: letters/numbers, plus the
+/// apostrophe so "doesn't" stays one word. Everything else is punctuation.
+fn word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '\''
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +257,28 @@ mod tests {
         assert!(b.redo());
         assert_eq!(b.text(), "**hello** world");
     }
+    #[test]
+    fn ctrl_arrows_move_by_words() {
+        let b = Buffer::new("hello world\n  again, friend");
+        assert_eq!(b.word_end_right(0), 5);
+        assert_eq!(b.word_end_right(5), 11);
+        assert_eq!(b.word_start_left(11), 6);
+        assert_eq!(b.word_start_left(6), 0);
+        assert_eq!(b.word_start_left(0), 0);
+        // Newlines count as whitespace, so a jump crosses them.
+        assert_eq!(b.word_end_right(11), 19);
+        assert_eq!(b.word_end_right(12), 19);
+        // Punctuation runs are their own unit.
+        assert_eq!(b.word_end_right(19), 20);
+        assert_eq!(b.word_end_right(20), 27);
+        assert_eq!(b.word_start_left(27), 21);
+        assert_eq!(b.word_start_left(19), 14);
+        // Apostrophes keep contractions together.
+        let c = Buffer::new("but if it doesn't?");
+        assert_eq!(c.word_end_right(10), 17);
+        assert_eq!(c.word_start_left(17), 10);
+    }
+
     #[test]
     fn grapheme_step() {
         let b = Buffer::new("a😀b");
