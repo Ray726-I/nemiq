@@ -121,9 +121,9 @@ fn parse_color(s: &str, fallback: u32) -> Hsla {
     let h = s.trim().trim_start_matches('#');
     let v = u32::from_str_radix(h, 16).unwrap_or(fallback);
     if h.len() == 3 {
-        let r = (v >> 8 & 0xf) as u32 * 17;
-        let g = (v >> 4 & 0xf) as u32 * 17;
-        let b = (v & 0xf) as u32 * 17;
+        let r = (v >> 8 & 0xf) * 17;
+        let g = (v >> 4 & 0xf) * 17;
+        let b = (v & 0xf) * 17;
         rgb((r << 16) | (g << 8) | b).into()
     } else {
         rgb(v).into()
@@ -493,10 +493,6 @@ impl EditorView {
     /// True while vim Normal/Visual owns the keyboard.
     fn vim_blocks(&self) -> bool {
         self.vim_enabled && self.vim.is_normal()
-    }
-
-    pub fn vim_mode(&self) -> VimMode {
-        self.vim.mode
     }
 
     /// Height of the `:` line, when open.
@@ -2831,7 +2827,7 @@ impl EditorView {
     fn to_utf16(&self, off: usize) -> usize {
         self.chars().iter().take(off).map(|c| c.len_utf16()).sum()
     }
-    fn from_utf16(&self, off: usize) -> usize {
+    fn char_index_from_utf16(&self, off: usize) -> usize {
         let mut u16c = 0;
         for (i, c) in self.chars().iter().enumerate() {
             if u16c >= off {
@@ -2852,8 +2848,8 @@ impl EntityInputHandler for EditorView {
         _cx: &mut Context<Self>,
     ) -> Option<String> {
         let t = self.text();
-        let a = self.from_utf16(range.start);
-        let b = self.from_utf16(range.end);
+        let a = self.char_index_from_utf16(range.start);
+        let b = self.char_index_from_utf16(range.end);
         adjusted_range.replace(self.to_utf16(a)..self.to_utf16(b));
         Some(t.chars().skip(a).take(b.saturating_sub(a)).collect())
     }
@@ -2881,7 +2877,12 @@ impl EntityInputHandler for EditorView {
         cx: &mut Context<Self>,
     ) {
         let (a, b) = range
-            .map(|r| (self.from_utf16(r.start), self.from_utf16(r.end)))
+            .map(|r| {
+                (
+                    self.char_index_from_utf16(r.start),
+                    self.char_index_from_utf16(r.end),
+                )
+            })
             .unwrap_or_else(|| self.sel());
         if self.close_prompt || self.pending_external.is_some() {
             return;
@@ -2933,7 +2934,12 @@ impl EntityInputHandler for EditorView {
             return;
         }
         let (a, b) = range
-            .map(|r| (self.from_utf16(r.start), self.from_utf16(r.end)))
+            .map(|r| {
+                (
+                    self.char_index_from_utf16(r.start),
+                    self.char_index_from_utf16(r.end),
+                )
+            })
             .unwrap_or_else(|| self.sel());
         self.replace(a, b, new_text.to_string(), cx);
     }
@@ -3908,16 +3914,14 @@ fn list_marker(chars: &[char]) -> Option<usize> {
     while i < chars.len() && chars[i] == ' ' {
         i += 1;
     }
-    let start = i;
     if i < chars.len() && matches!(chars[i], '-' | '+' | '*') {
-        let m = i;
         i += 1;
         if i < chars.len() && chars[i] == ' ' {
             // a thematic break is not a bullet
             if is_thematic_break(&chars.iter().collect::<String>()) {
                 return None;
             }
-            return Some(i + 1 - 0 * m);
+            return Some(i + 1);
         }
     }
     let digits = chars[i..].iter().take_while(|c| c.is_ascii_digit()).count();
@@ -3927,7 +3931,6 @@ fn list_marker(chars: &[char]) -> Option<usize> {
             return Some(i + 2);
         }
     }
-    let _ = start;
     None
 }
 
@@ -3962,6 +3965,9 @@ pub struct Prepaint {
     link_expanded: Option<usize>,
     show_numbers: bool,
     yank_flash: Option<(usize, usize)>,
+    /// Hover target for the scrollbar; gives it an arrow cursor instead of the
+    /// surrounding editor's text I-beam.
+    scrollbar_hitbox: Option<Hitbox>,
 }
 
 impl Element for EditorElement {
@@ -4013,10 +4019,31 @@ impl Element for EditorElement {
                 view.cache.as_deref(),
             )),
         };
+        let scroll = px(view.scroll_y);
+        let scale = f32::from(layout.font_size) / BASE_FONT_PX;
+        let text_top = view.top_margin(_window.viewport_size());
+        let view_h = (bounds.size.height - text_top).max(px(1.));
+        let scrollbar_hitbox = scrollbar_geometry(
+            bounds,
+            f32::from(scroll),
+            layout.total_height,
+            view_h,
+            scale,
+        )
+        .map(|sb| {
+            let pad = px(6.0 * scale);
+            _window.insert_hitbox(
+                Bounds::new(
+                    point(sb.x - pad, sb.track_top),
+                    size(sb.width + pad + px(4.0 * scale), sb.track_height),
+                ),
+                HitboxBehavior::Normal,
+            )
+        });
         Prepaint {
             x0: bounds.left() + (bounds.size.width - layout.wrap_width) / 2.0,
-            y0: bounds.top() + view.top_margin(_window.viewport_size()),
-            scroll: px(view.scroll_y),
+            y0: bounds.top() + text_top,
+            scroll,
             scrollbar_alpha: view.scrollbar_alpha,
             layout,
             palette: Palette::new(&view.state),
@@ -4031,6 +4058,7 @@ impl Element for EditorElement {
             link_expanded: view.link_expanded,
             show_numbers: view.state.show_numbers,
             yank_flash: view.yank_flash,
+            scrollbar_hitbox,
         }
     }
     fn paint(
@@ -4207,12 +4235,10 @@ impl Element for EditorElement {
                 }
                 paint_selection(
                     window,
-                    &line.shaped,
+                    line,
                     la,
                     lb,
-                    line.disp_to_doc.len(),
                     point(p.x0, top),
-                    line.line_height,
                     p.layout.wrap_width,
                     p.palette.selection,
                 );
@@ -4237,12 +4263,10 @@ impl Element for EditorElement {
                 }
                 paint_selection(
                     window,
-                    &line.shaped,
+                    line,
                     la,
                     lb,
-                    line.disp_to_doc.len(),
                     point(p.x0, top),
-                    line.line_height,
                     p.layout.wrap_width,
                     p.palette.selection,
                 );
@@ -4274,12 +4298,10 @@ impl Element for EditorElement {
                     }
                     paint_selection(
                         window,
-                        &line.shaped,
+                        line,
                         la,
                         lb,
-                        line.disp_to_doc.len(),
                         point(p.x0, top),
-                        line.line_height,
                         p.layout.wrap_width,
                         color,
                     );
@@ -4429,6 +4451,9 @@ impl Element for EditorElement {
         }
 
         // Scrollbar overlay.
+        if let Some(hitbox) = &p.scrollbar_hitbox {
+            window.set_cursor_style(CursorStyle::Arrow, hitbox);
+        }
         let scale = f32::from(p.layout.font_size) / BASE_FONT_PX;
         let text_top = p.y0 - bounds.top();
         let view_h = (bounds.size.height - text_top).max(px(1.));
@@ -4496,15 +4521,16 @@ fn link_tip(p: &Prepaint) -> Option<(&LineBox, Pixels, Pixels, String)> {
 
 fn paint_selection(
     window: &mut Window,
-    shaped: &WrappedLine,
+    line: &LineBox,
     la: usize,
     lb: usize,
-    char_len: usize,
     origin: Point<Pixels>,
-    lh: Pixels,
     width: Pixels,
     color: Hsla,
 ) {
+    let char_len = line.disp_to_doc.len();
+    let lh = line.line_height;
+    let shaped = &line.shaped;
     let la = la.min(char_len);
     let lb = lb.min(char_len).max(la);
     let a_byte = char_to_byte(shaped.text.as_ref(), la);
@@ -4542,7 +4568,7 @@ fn paint_selection(
     while row < row_b {
         window.paint_quad(fill(
             Bounds::new(
-                point(origin.x, origin.y + px(row as f32 * f32::from(lh))),
+                point(origin.x, origin.y + px(row * f32::from(lh))),
                 size(width, lh),
             ),
             color,
@@ -5889,5 +5915,47 @@ impl Element for IconElement {
                 stroke(window, p(13.5, 13.0), p(2.5, 13.0), w, self.color);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // `gpui::*` re-exports a `test` macro; importing it here would make
+    // `#[test]` expand into itself, so name the helpers explicitly.
+    use super::{char_to_byte, list_marker, quote_marker};
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn list_marker_points_at_the_content() {
+        assert_eq!(list_marker(&chars("- item")), Some(2));
+        assert_eq!(list_marker(&chars("  * item")), Some(4));
+        assert_eq!(list_marker(&chars("+ x")), Some(2));
+        assert_eq!(list_marker(&chars("1. item")), Some(3));
+        assert_eq!(list_marker(&chars("10) item")), Some(4));
+    }
+
+    #[test]
+    fn list_marker_rejects_prose_and_thematic_breaks() {
+        assert_eq!(list_marker(&chars("plain text")), None);
+        assert_eq!(list_marker(&chars("-no space")), None);
+        assert_eq!(list_marker(&chars("***")), None);
+        assert_eq!(list_marker(&chars("- - -")), None);
+    }
+
+    #[test]
+    fn quote_marker_reports_width_and_content_start() {
+        assert_eq!(quote_marker(&chars("> quoted")), Some((2, 2)));
+        assert_eq!(quote_marker(&chars("  >> deep")), Some((3, 5)));
+        assert_eq!(quote_marker(&chars("plain")), None);
+    }
+
+    #[test]
+    fn char_to_byte_handles_multibyte_text() {
+        assert_eq!(char_to_byte("abc", 1), 1);
+        assert_eq!(char_to_byte("\u{e9}a", 1), 2);
+        assert_eq!(char_to_byte("a", 9), 1);
     }
 }

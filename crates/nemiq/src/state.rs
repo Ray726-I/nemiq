@@ -14,10 +14,6 @@ fn data_dir() -> PathBuf {
         .join("nemiq")
 }
 
-fn recovery_path() -> PathBuf {
-    data_dir().join("recovery.json")
-}
-
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct Recovery {
     file_url: String,
@@ -45,10 +41,15 @@ pub struct DocState {
     pub autosave_suspended: bool,
     pub show_numbers: bool,
     last_saved_text: String,
+    state_dir: PathBuf,
 }
 
 impl DocState {
     pub fn new() -> Self {
+        Self::with_state_dir(data_dir())
+    }
+
+    fn with_state_dir(state_dir: PathBuf) -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         let theme = OmarchyTheme::load(&home, true);
         // persisted zoom
@@ -75,6 +76,7 @@ impl DocState {
             autosave_suspended: false,
             show_numbers: Self::numbers_pref(),
             last_saved_text: String::new(),
+            state_dir,
         };
         s.restore_recovery();
         s.refresh_wordcount();
@@ -332,11 +334,15 @@ impl DocState {
         self.write_recovery();
     }
 
+    fn recovery_file(&self) -> PathBuf {
+        self.state_dir.join("recovery.json")
+    }
+
     fn write_recovery(&self) {
         if !self.modified {
             return;
         }
-        let _ = std::fs::create_dir_all(data_dir());
+        let _ = std::fs::create_dir_all(&self.state_dir);
         let r = Recovery {
             file_url: self
                 .file_path
@@ -346,17 +352,17 @@ impl DocState {
             text: self.text(),
         };
         let _ = std::fs::write(
-            recovery_path(),
+            self.recovery_file(),
             serde_json::to_string(&r).unwrap_or_default(),
         );
     }
 
     fn restore_recovery(&mut self) {
-        let Ok(raw) = std::fs::read(recovery_path()) else {
+        let Ok(raw) = std::fs::read(self.recovery_file()) else {
             return;
         };
         let Ok(r): Result<Recovery, _> = serde_json::from_slice(&raw) else {
-            let _ = std::fs::remove_file(recovery_path());
+            let _ = std::fs::remove_file(self.recovery_file());
             return;
         };
         if r.text.is_empty() && r.file_url.is_empty() {
@@ -385,7 +391,7 @@ impl DocState {
     }
 
     pub fn clear_recovery(&self) {
-        let _ = std::fs::remove_file(recovery_path());
+        let _ = std::fs::remove_file(self.recovery_file());
     }
 
     pub fn discard_recovery(&mut self) {
@@ -475,5 +481,142 @@ impl DocState {
         self.editor_font = family.to_string();
         let _ = std::fs::create_dir_all(config_dir());
         let _ = std::fs::write(font_path(), family);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn state_in(dir: &TempDir) -> DocState {
+        DocState::with_state_dir(dir.path().join("state"))
+    }
+
+    #[test]
+    fn editing_and_reverting_returns_to_clean() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = state_in(&tmp);
+        assert!(!s.modified);
+
+        s.set_text("hello world".to_string());
+        assert!(s.modified);
+        assert_eq!(s.word_count, 2);
+        assert_eq!(s.status, "Unsaved");
+
+        s.set_text(String::new());
+        assert!(!s.modified);
+        assert_eq!(s.word_count, 0);
+    }
+
+    #[test]
+    fn open_reads_the_file_and_starts_clean() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("note.md");
+        fs::write(&file, "one\ntwo\n").unwrap();
+        let mut s = state_in(&tmp);
+
+        assert!(s.open(&file));
+        assert_eq!(s.text(), "one\ntwo\n");
+        assert_eq!(s.word_count, 2);
+        assert_eq!(s.file_name(), "note.md");
+        assert!(!s.modified);
+        assert!(!s.autosave_suspended);
+    }
+
+    #[test]
+    fn opening_a_crlf_file_turns_autosave_off() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("crlf.md");
+        fs::write(&file, "one\r\ntwo\r\n").unwrap();
+        let mut s = state_in(&tmp);
+
+        assert!(s.open(&file));
+        assert!(s.autosave_suspended);
+        s.set_text("one\ntwo\nchanged\n".to_string());
+        assert!(!s.auto_save());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn autosave_writes_when_the_file_is_clean() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("note.md");
+        fs::write(&file, "one\n").unwrap();
+        let mut s = state_in(&tmp);
+        assert!(s.open(&file));
+
+        s.set_text("one two\n".to_string());
+        assert!(s.modified);
+        assert!(s.auto_save());
+        assert!(!s.modified);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one two\n");
+    }
+
+    #[test]
+    fn external_edit_is_reported_once_and_blocks_autosave() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("note.md");
+        fs::write(&file, "mine\n").unwrap();
+        let mut s = state_in(&tmp);
+        assert!(s.open(&file));
+        s.set_text("my edit\n".to_string());
+
+        fs::write(&file, "theirs\n").unwrap();
+        assert_eq!(s.check_external(), Some(ExternalChange::Modified));
+        assert!(s.autosave_suspended);
+        assert_eq!(s.check_external(), None);
+        assert!(!s.auto_save());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "theirs\n");
+    }
+
+    #[test]
+    fn deleted_file_is_reported() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("gone.md");
+        fs::write(&file, "x\n").unwrap();
+        let mut s = state_in(&tmp);
+        assert!(s.open(&file));
+        fs::remove_file(&file).unwrap();
+
+        assert_eq!(s.check_external(), Some(ExternalChange::Deleted));
+        assert!(s.autosave_suspended);
+    }
+
+    #[test]
+    fn autosave_never_writes_a_file_that_was_never_saved() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = state_in(&tmp);
+        let file = tmp.path().join("new.md");
+        s.open_or_start(&file);
+        assert_eq!(s.file_path.as_deref(), Some(file.as_path()));
+        assert!(!s.modified);
+
+        s.set_text("draft".to_string());
+        assert!(!s.auto_save());
+        assert!(s.autosave_suspended);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn recovery_round_trips_unsaved_work() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        {
+            let mut s = DocState::with_state_dir(state_dir.clone());
+            s.set_text("unsaved draft".to_string());
+            s.persist_recovery();
+        }
+
+        let mut restored = DocState::with_state_dir(state_dir.clone());
+        assert_eq!(restored.text(), "unsaved draft");
+        assert!(restored.modified);
+        assert!(restored.status.contains("Recovered"));
+
+        restored.discard_recovery();
+        let third = DocState::with_state_dir(state_dir);
+        assert_eq!(third.text(), "");
+        assert!(!third.modified);
     }
 }

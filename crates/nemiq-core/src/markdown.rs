@@ -108,7 +108,7 @@ pub fn closes_fence(text: &str, opening_len: usize, marker: char) -> bool {
     if let Ok(Some(caps)) = r.captures(text) {
         if let Some(g) = caps.get(1) {
             let s = g.as_str();
-            if s.chars().count() >= opening_len && s.chars().next() == Some(marker) {
+            if s.chars().count() >= opening_len && s.starts_with(marker) {
                 return true;
             }
         }

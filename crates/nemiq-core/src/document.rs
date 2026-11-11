@@ -6,7 +6,7 @@
 use ropey::Rope;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Modal state reserved for future vim integration. UI stays in Insert.
+/// Modal editing state used by the vim key handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VimMode {
     #[default]
@@ -49,7 +49,6 @@ pub struct Buffer {
     rope: Rope,
     undo: Vec<String>,
     redo: Vec<String>,
-    pub vim_mode: VimMode,
 }
 
 impl Buffer {
@@ -58,7 +57,6 @@ impl Buffer {
             rope: Rope::from_str(&text.replace("\r\n", "\n").replace('\r', "\n")),
             undo: vec![],
             redo: vec![],
-            vim_mode: VimMode::Insert,
         }
     }
     pub fn text(&self) -> String {
@@ -143,20 +141,16 @@ impl Buffer {
             } => {
                 let lines: Vec<String> = self.rope.lines().map(|l| l.to_string()).collect();
                 let mut out = lines.clone();
-                for i in start_line..=end_line.min(lines.len().saturating_sub(1)) {
+                let last = end_line.min(lines.len().saturating_sub(1));
+                for line in out.iter_mut().take(last + 1).skip(start_line) {
                     if outdent {
                         // remove up to 4 leading spaces
-                        let mut rm = 0;
-                        for c in out[i].chars().take(4) {
-                            if c == ' ' {
-                                rm += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        out[i] = out[i][rm..].to_string();
+                        let rm = line.chars().take(4).take_while(|c| *c == ' ').count();
+                        let trimmed = line[rm..].to_string();
+                        *line = trimmed;
                     } else {
-                        out[i] = format!("    {}", out[i]);
+                        let indented = format!("    {line}");
+                        *line = indented;
                     }
                 }
                 self.rope = Rope::from_str(&out.join(""));

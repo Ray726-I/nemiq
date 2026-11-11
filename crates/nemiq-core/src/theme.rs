@@ -20,8 +20,7 @@ fn valid_color(s: &str) -> bool {
         return false;
     }
     // Accept #rgb/#rrggbb/#rrggbbaa + a few named (black/white) for tests.
-    if s.starts_with('#') {
-        let h = &s[1..];
+    if let Some(h) = s.strip_prefix('#') {
         matches!(h.len(), 3 | 4 | 6 | 8) && h.chars().all(|c| c.is_ascii_hexdigit())
     } else {
         matches!(s, "black" | "white" | "red" | "green" | "blue")

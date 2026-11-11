@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 nemiq-core = { path = "../nemiq-core" }
-gpui = "*"
+gpui = "0.2"
 ropey = "1.6"
 unicode-segmentation = "1.12"
 serde = { version = "1.0", features = ["derive"] }
@@ -22,3 +22,6 @@ dirs = "6"
 notify = "6"
 rfd = "0.15"
 pulldown-cmark = "0.12"
+
+[dev-dependencies]
+tempfile = "3"

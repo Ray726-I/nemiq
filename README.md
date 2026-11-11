@@ -74,7 +74,7 @@ cargo run -p nemiq                          # empty document
 cargo run -p nemiq -- notes.md              # open (or start) a file
 cargo run -p nemiq -- --vim notes.md        # modal editing
 cargo run -p nemiq -- --export out.pdf notes.md   # convert and exit
-cargo test -p nemiq-core                    # text and document logic tests
+cargo test --workspace                      # core text logic and app state tests
 cargo build --release -p nemiq              # binary at target/release/nemiq
 ```
 

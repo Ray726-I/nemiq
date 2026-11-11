@@ -89,9 +89,7 @@ enum Motion {
     LineStart,
     FirstNonBlank,
     LineEnd,
-    DocStart,
     DocEnd,
-    Line,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -823,9 +821,7 @@ fn resolve(c: &[char], cursor: usize, motion: Motion, count: usize) -> usize {
                 le
             }
         }
-        Motion::DocStart => 0,
         Motion::DocEnd => last_line_start(c),
-        Motion::Line => first_non_blank(c, cursor),
     }
 }
 
@@ -897,17 +893,12 @@ fn operator_range(c: &[char], cursor: usize, motion: Motion, count: usize) -> (u
         Motion::LineStart => (line_start(c, cursor), cursor, false),
         Motion::FirstNonBlank => (first_non_blank(c, cursor), cursor, false),
         Motion::LineEnd => (cursor, line_end(c, cursor), false),
-        Motion::DocStart => (0, line_end(c, cursor) + 1, true),
         Motion::DocEnd => (line_start(c, cursor), c.len(), true),
         Motion::Up | Motion::Down => {
             let target_line = move_vertical(c, cursor, motion, count);
             let a = line_start(c, cursor).min(line_start(c, target_line));
             let b = line_end(c, cursor).max(line_end(c, target_line));
             (a, (b + 1).min(c.len()), true)
-        }
-        Motion::Line => {
-            let (start, end) = linewise_range(c, cursor, count);
-            (start, end, true)
         }
     }
 }
