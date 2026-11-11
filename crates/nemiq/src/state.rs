@@ -43,6 +43,7 @@ pub struct DocState {
     known_contents: Option<Vec<u8>>,
     known_text: String,
     pub autosave_suspended: bool,
+    pub show_numbers: bool,
     last_saved_text: String,
 }
 
@@ -72,6 +73,7 @@ impl DocState {
             known_contents: None,
             known_text: String::new(),
             autosave_suspended: false,
+            show_numbers: Self::numbers_pref(),
             last_saved_text: String::new(),
         };
         s.restore_recovery();
@@ -404,6 +406,17 @@ impl DocState {
             .unwrap_or(false)
     }
 
+    pub fn numbers_pref() -> bool {
+        std::fs::read_to_string(numbers_path())
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false)
+    }
+
+    pub fn save_numbers_pref(&self, on: bool) {
+        let _ = std::fs::create_dir_all(config_dir());
+        let _ = std::fs::write(numbers_path(), if on { "1" } else { "0" });
+    }
+
     pub fn save_vim_pref(&self, on: bool) {
         let _ = std::fs::create_dir_all(config_dir());
         let _ = std::fs::write(vim_path(), if on { "1" } else { "0" });
@@ -427,6 +440,9 @@ fn font_path() -> PathBuf {
 }
 fn vim_path() -> PathBuf {
     config_dir().join("vim")
+}
+fn numbers_path() -> PathBuf {
+    config_dir().join("numbers")
 }
 fn window_path() -> PathBuf {
     config_dir().join("window")

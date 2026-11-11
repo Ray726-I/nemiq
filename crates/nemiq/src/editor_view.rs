@@ -11,8 +11,8 @@
 use crate::state::DocState;
 use gpui::*;
 use nemiq_core::{
-    inline_markup, is_thematic_break, opening_fence_length, InlineKind, VimCommand, VimKey,
-    VimMode, VimState,
+    inline_markup, is_thematic_break, opening_fence_length, InlineKind, OmarchyTheme, VimCommand,
+    VimKey, VimMode, VimState,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -48,6 +48,10 @@ actions!(
         Down,
         SelectLeft,
         SelectRight,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
         SelectUp,
         SelectDown,
         Home,
@@ -71,6 +75,8 @@ actions!(
         ToggleFullscreen,
         Shortcuts,
         OpenPalette,
+        ExpandLink,
+        ToggleNumbers,
         DialogCancel,
         DialogDiscard,
         DialogSave,
@@ -78,6 +84,16 @@ actions!(
 );
 
 const BASE_FONT_PX: f32 = 20.0;
+/// Omawrite's Qt editor asks for 140% *proportional* line height. Qt rounds the
+/// font's ascent and descent to whole pixels before applying that percentage,
+/// so the effective leading is a little more than 1.4 x the font's 1.3em
+/// metrics. Reproduce the rounding, otherwise the same text reads noticeably
+/// tighter here than in Omawrite.
+fn line_height_for(font_size: Pixels) -> Pixels {
+    let size = f32::from(font_size);
+    let natural = (size * 1.025).ceil() + (size * 0.275).ceil();
+    px(natural * 1.4)
+}
 const FOOTER_PX: f32 = 32.0;
 
 // Slim overlay scrollbar: thin, theme-muted, out of the way.
@@ -94,6 +110,7 @@ struct Palette {
     marker: Hsla,
     accent: Hsla,
     code_bg: Hsla,
+    inline_fg: Hsla,
     selection: Hsla,
     search: Hsla,
     search_current: Hsla,
@@ -117,9 +134,12 @@ impl Palette {
     fn new(state: &DocState) -> Self {
         let t = &state.theme;
         let dark = t.dark;
+        let fg = parse_color(&t.foreground, if dark { 0xeeeeee } else { 0x222324 });
+        let bg = parse_color(&t.background, if dark { 0x101010 } else { 0xffffff });
         Self {
-            bg: parse_color(&t.background, if dark { 0x101010 } else { 0xffffff }),
-            fg: parse_color(&t.foreground, if dark { 0xeeeeee } else { 0x222324 }),
+            bg,
+            fg,
+            inline_fg: rgb(if dark { 0xc9a26b } else { 0x8a5a20 }).into(),
             muted: rgb(if dark { 0x909191 } else { 0xaeb1b5 }).into(),
             marker: rgb(if dark { 0x4f525a } else { 0xaeb1b5 }).into(),
             accent: parse_color(&t.accent, if dark { 0x5584aa } else { 0x2077b2 }),
@@ -134,13 +154,14 @@ impl Palette {
     /// Cheap identity for "did styling inputs change?" checks.
     fn key(&self) -> String {
         format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
             self.bg,
             self.fg,
             self.muted,
             self.marker,
             self.accent,
             self.code_bg,
+            self.inline_fg,
             self.selection,
             self.search,
             self.search_current,
@@ -169,6 +190,13 @@ struct LineBox {
     caret_local: Option<usize>,
     /// 0 normal, 1 aligned table row, 2 table rule, 3 collapsed fence marker.
     mode: u8,
+    /// Which link (if any) was open when this block was built.
+    link_state: Option<usize>,
+    /// 1-based number of the block's first source line.
+    first_line: usize,
+    /// Doc-local ranges occupied by a collapsed link's syntax (`[` and
+    /// `](url)`). They are never painted, so the caret must not rest there.
+    hidden_links: Vec<(usize, usize)>,
 }
 
 impl LineBox {
@@ -288,6 +316,9 @@ pub struct EditorView {
     pub search_open: bool,
     pub search_text: String,
     pub replace_open: bool,
+    search_fresh: bool,
+    /// Doc offset of a link whose source is shown for editing (Tab).
+    link_expanded: Option<usize>,
     replace_text: String,
     replace_focus: bool,
     pub matches: Vec<usize>,
@@ -295,7 +326,16 @@ pub struct EditorView {
     revision: u64,
     cache: Option<Arc<Layout>>,
     autosave_task: Option<Task<()>>,
+    /// Last text this window put on the system clipboard, and whether it was
+    /// a linewise yank. Used to tell our own writes from other apps' copies.
+    clipboard_mirror: Option<String>,
+    clipboard_linewise: bool,
+    /// Brief highlight of what was just yanked, in document offsets.
+    yank_flash: Option<(usize, usize)>,
+    yank_flash_task: Option<Task<()>>,
     _watch_task: Option<Task<()>>,
+    /// Re-reads Omarchy's colours so a theme switch applies without a restart.
+    _theme_task: Option<Task<()>>,
     pub bounds_sub: Option<Subscription>,
     pub pending_external: Option<crate::state::ExternalChange>,
     pub external_deleted: bool,
@@ -309,6 +349,8 @@ pub struct EditorView {
     font_names: Vec<String>,
     /// Which unsaved-changes button has keyboard focus (0 cancel, 1 discard, 2 save).
     pub close_focus: usize,
+    undo_cursors: Vec<usize>,
+    redo_cursors: Vec<usize>,
     pub vim_enabled: bool,
     vim: VimState,
     pub palette_open: bool,
@@ -347,8 +389,37 @@ impl EditorView {
                 break;
             }
         });
+        let theme_watcher = cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            let keep_going = this
+                .update(cx, |v: &mut EditorView, cx| {
+                    let home = std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .or_else(dirs::home_dir)
+                        .unwrap_or_default();
+                    // Switching themes swaps a symlink; skip the instant where
+                    // the file is briefly gone instead of flashing the fallback.
+                    if !OmarchyTheme::colors_path(&home).exists() {
+                        return true;
+                    }
+                    let theme = OmarchyTheme::load(&home, true);
+                    if theme != v.state.theme {
+                        v.state.theme = theme;
+                        v.bump();
+                        cx.notify();
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !keep_going {
+                break;
+            }
+        });
         Self {
             _watch_task: Some(watcher),
+            _theme_task: Some(theme_watcher),
             bounds_sub: None,
             state: DocState::new(),
             focus: cx.focus_handle(),
@@ -365,6 +436,8 @@ impl EditorView {
             search_open: false,
             search_text: String::new(),
             replace_open: false,
+            search_fresh: false,
+            link_expanded: None,
             replace_text: String::new(),
             replace_focus: false,
             matches: vec![],
@@ -372,6 +445,10 @@ impl EditorView {
             revision: 0,
             cache: None,
             autosave_task: None,
+            clipboard_mirror: None,
+            clipboard_linewise: false,
+            yank_flash: None,
+            yank_flash_task: None,
             pending_external: None,
             external_deleted: false,
             close_prompt: false,
@@ -383,6 +460,8 @@ impl EditorView {
             font_window: 0,
             font_names,
             close_focus: 2,
+            undo_cursors: Vec::new(),
+            redo_cursors: Vec::new(),
             vim_enabled,
             vim: if vim_enabled {
                 VimState::with_mode(VimMode::Normal)
@@ -579,7 +658,7 @@ impl EditorView {
         let palette = Palette::new(&self.state);
         let palette_key = palette.key();
         let prev = prev.filter(|p| p.palette_key == palette_key);
-        let line_height = font_size * 1.4;
+        let line_height = line_height_for(font_size);
         let fences = fence_states(&text);
         let source: Vec<&str> = text.split('\n').collect();
         let caret_line = {
@@ -598,21 +677,37 @@ impl EditorView {
         };
         let tables = table_lines(&source, caret_line, &fences);
         let fence_blocks = fence_blocks(&source);
+        let mut starts: Vec<usize> = Vec::with_capacity(source.len());
+        let mut acc = 0usize;
+        for line in &source {
+            starts.push(acc);
+            acc += line.chars().count() + 1;
+        }
+
         let mut lines = Vec::new();
         let mut top = Pixels::ZERO;
-        let mut start_char = 0usize;
-        for (i, line) in text.split('\n').enumerate() {
+        let mut i = 0usize;
+        while i < source.len() {
+            // How many source lines fold into this block? Plain paragraphs and
+            // list continuations reflow into one wrapped block; headings,
+            // lists, quotes, tables, rules and fences stay single-line.
+            let mut end = i + 1;
+            while end < source.len() && joins_paragraph(&source, i, end, &fences, &tables) {
+                end += 1;
+            }
+            let line = source[i];
             let fence = *fences.get(i).unwrap_or(&false);
-            let line_start = start_char;
-            let char_len = line.chars().count();
-            let caret_local = (self.cursor >= line_start && self.cursor <= line_start + char_len)
+            let line_start = starts[i];
+            let block_end_char = starts[end - 1] + source[end - 1].chars().count();
+            let char_len = block_end_char - line_start;
+            let caret_local = (self.cursor >= line_start && self.cursor <= block_end_char)
                 .then(|| self.cursor - line_start);
             let table = tables.get(i).and_then(|t| t.as_ref());
             let in_fence_block = fence_blocks
                 .iter()
                 .find(|&&(a, b)| i >= a && i <= b)
                 .is_some_and(|&(a, b)| caret_line >= a && caret_line <= b);
-            let collapse = is_fence_delimiter(line) && !in_fence_block;
+            let collapse = end == i + 1 && is_fence_delimiter(line) && !in_fence_block;
             let mode = if collapse {
                 3
             } else if table.is_some() {
@@ -624,54 +719,143 @@ impl EditorView {
             } else {
                 0
             };
+            let src_key = source[i..end].join("\n");
 
-            // Unchanged line: reuse its shaped text and display map. This keeps
-            // typing O(1) in document size.
-            if let Some(old) = prev.and_then(|p| p.lines.get(i)) {
-                if old.src == line
+            // Unchanged block: reuse its shaped text and display map. This
+            // keeps typing O(1) in document size.
+            let old = prev.and_then(|p| p.lines.iter().find(|l| l.start_char == line_start));
+            if let Some(old) = old {
+                if old.src == src_key
                     && old.fence == fence
                     && old.caret_local == caret_local
                     && old.mode == mode
+                    && old.link_state == self.link_expanded
                 {
                     lines.push(LineBox {
                         start_char: line_start,
                         top,
                         src: old.src.clone(),
                         caret_local,
+                        first_line: i + 1,
                         ..(*old).clone()
                     });
                     top += old.height;
-                    start_char += char_len + 1;
+                    i = end;
                     continue;
                 }
             }
 
-            let styles = line_styles(line, &palette, fence);
-            let level = if caret_local.is_none() {
-                heading_level(line)
-            } else {
-                0
-            };
-            let size = font_size * heading_scale(level);
-            let lh = size * 1.4;
-            let (display, disp_to_doc, doc_to_disp) = if collapse {
-                (Vec::new(), Vec::new(), vec![usize::MAX; char_len])
-            } else {
-                build_display(line, fence, line_start, self.cursor, table)
-            };
-            let mut display_styles: Vec<CharStyle> = Vec::with_capacity(display.len());
-            let rule = mode == 2;
-            for &doc in &disp_to_doc {
-                let mut style = styles
-                    .get(doc)
-                    .cloned()
-                    .unwrap_or_else(|| normal_style(&palette));
-                if rule {
-                    style.color = palette.marker;
-                    style.bg = None;
+            let level = heading_level(line);
+            let mut size = font_size * heading_scale(level);
+            let lh = line_height_for(size);
+
+            let (display, disp_to_doc, doc_to_disp, display_styles) = if collapse {
+                let styles = line_styles(line, &palette, fence);
+                let _ = styles;
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    vec![usize::MAX; char_len],
+                    Vec::new(),
+                )
+            } else if end == i + 1 {
+                let styles = line_styles(line, &palette, fence);
+                let (display, disp_to_doc, doc_to_disp) = build_display(
+                    line,
+                    fence,
+                    line_start,
+                    self.cursor,
+                    table,
+                    self.link_expanded,
+                );
+                let rule = mode == 2;
+                let header = tables
+                    .get(i)
+                    .and_then(|t| t.as_ref())
+                    .is_some_and(|t| t.header);
+                let mut display_styles: Vec<CharStyle> = Vec::with_capacity(display.len());
+                for &doc in &disp_to_doc {
+                    let mut style = styles
+                        .get(doc)
+                        .cloned()
+                        .unwrap_or_else(|| normal_style(&palette));
+                    if rule {
+                        style.color = palette.marker;
+                        style.bg = None;
+                    }
+                    if header {
+                        style.weight = FontWeight::BOLD;
+                    }
+                    display_styles.push(style);
                 }
-                display_styles.push(style);
+                (display, disp_to_doc, doc_to_disp, display_styles)
+            } else {
+                // Reflow: join the block's lines with a space and wrap them as
+                // one paragraph, so hard-wrapped source fills the column.
+                let mut display: Vec<char> = Vec::new();
+                let mut disp_to_doc: Vec<usize> = Vec::new();
+                let mut doc_to_disp = vec![usize::MAX; char_len];
+                let mut display_styles: Vec<CharStyle> = Vec::new();
+                for j in i..end {
+                    let part = source[j];
+                    let base = starts[j] - line_start;
+                    let lead = part.chars().take_while(|c| *c == ' ').count();
+                    if j > i {
+                        let nl = base.saturating_sub(1);
+                        display.push(' ');
+                        disp_to_doc.push(nl);
+                        if nl < doc_to_disp.len() {
+                            doc_to_disp[nl] = display.len() - 1;
+                        }
+                        display_styles.push(normal_style(&palette));
+                    }
+                    let styles = line_styles(part, &palette, false);
+                    let (disp, dmap, _) = build_display(
+                        part,
+                        false,
+                        starts[j],
+                        self.cursor,
+                        None,
+                        self.link_expanded,
+                    );
+                    for (idx, &doc_local) in dmap.iter().enumerate() {
+                        if j > i && doc_local < lead {
+                            continue;
+                        }
+                        let doc = base + doc_local;
+                        if doc >= doc_to_disp.len() {
+                            continue;
+                        }
+                        doc_to_disp[doc] = display.len();
+                        display.push(disp[idx]);
+                        disp_to_doc.push(doc);
+                        display_styles.push(
+                            styles
+                                .get(doc_local)
+                                .cloned()
+                                .unwrap_or_else(|| normal_style(&palette)),
+                        );
+                    }
+                }
+                (display, disp_to_doc, doc_to_disp, display_styles)
+            };
+
+            let mut hidden_links = Vec::new();
+            if !fence && !collapse && table.is_none() {
+                if end == i + 1 {
+                    hidden_links = collapsed_link_ranges(line, line_start, self.link_expanded);
+                } else {
+                    for j in i..end {
+                        let base = starts[j] - line_start;
+                        for (a, b) in
+                            collapsed_link_ranges(source[j], starts[j], self.link_expanded)
+                        {
+                            hidden_links.push((base + a, base + b));
+                        }
+                    }
+                }
             }
+
             let runs = styles_to_runs(&display, &display_styles, &palette);
             let shaped_line: SharedString = if display.is_empty() {
                 SharedString::from(" ")
@@ -696,9 +880,21 @@ impl EditorView {
             } else {
                 runs
             };
+            if mode == 1 || mode == 2 {
+                let chars = display.len().max(1) as f32;
+                let fit = px(f32::from(wrap_width) / (chars * 0.6));
+                if fit < size {
+                    size = fit.max(px(7.0));
+                }
+            }
+            let wrap = if mode == 1 || mode == 2 {
+                None
+            } else {
+                Some(wrap_width)
+            };
             let shaped = window
                 .text_system()
-                .shape_text(shaped_line, size, &runs, Some(wrap_width), None)
+                .shape_text(shaped_line, size, &runs, wrap, None)
                 .ok()
                 .and_then(|mut v| v.drain(..).next());
             let height = if collapse {
@@ -717,12 +913,15 @@ impl EditorView {
                 fence,
                 disp_to_doc,
                 doc_to_disp,
-                src: line.to_string(),
+                src: src_key,
                 caret_local,
                 mode,
+                link_state: self.link_expanded,
+                first_line: i + 1,
+                hidden_links,
             });
             top += height;
-            start_char += char_len + 1;
+            i = end;
         }
         Layout {
             lines,
@@ -760,6 +959,45 @@ impl EditorView {
         self.scroll_to_pos(cx);
     }
 
+    fn set_clipboard(&mut self, text: String, linewise: bool, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        self.clipboard_mirror = Some(text);
+        self.clipboard_linewise = linewise;
+    }
+
+    /// Vim's `p` pastes the register, but the clipboard is shared with the rest
+    /// of the desktop. If another app copied something since our last
+    /// yank/copy, paste that text like Ctrl+V would.
+    fn sync_clipboard_register(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) else {
+            return;
+        };
+        if self.vim.register() == text.as_str() {
+            return;
+        }
+        let linewise =
+            self.clipboard_linewise && self.clipboard_mirror.as_deref() == Some(text.as_str());
+        self.vim.set_register(text, linewise);
+    }
+
+    /// Flash the yanked range for a moment, the way Neovim does.
+    fn flash_yank(&mut self, start: usize, end: usize, cx: &mut Context<Self>) {
+        if start >= end {
+            return;
+        }
+        self.yank_flash = Some((start, end));
+        self.yank_flash_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(220))
+                .await;
+            this.update(cx, |v: &mut EditorView, cx| {
+                v.yank_flash = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn scroll_to_pos(&mut self, cx: &mut Context<Self>) {
         // Keep wheel handler bounds in sync after programmatic scrolls.
         cx.notify();
@@ -779,9 +1017,22 @@ impl EditorView {
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         self.bump();
         self.state.refresh_wordcount();
-        self.refresh_search();
+        if self.search_open {
+            self.refresh_search();
+        } else if !self.matches.is_empty() {
+            // Editing after the find bar closed makes those offsets stale.
+            // Drop the highlight but keep the query for the next Ctrl+F.
+            self.matches.clear();
+            self.match_idx = -1;
+        }
         self.schedule_autosave(cx);
         cx.notify();
+    }
+
+    /// Remember where the caret was before another undoable edit.
+    fn note_edit(&mut self) {
+        self.undo_cursors.push(self.cursor);
+        self.redo_cursors.clear();
     }
 
     fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
@@ -802,6 +1053,7 @@ impl EditorView {
         if self.modal_open() || self.vim_blocks() {
             return;
         }
+        self.note_edit();
         let caret = self.state.apply_replace(start, end, text);
         self.cursor = caret;
         self.anchor = caret;
@@ -829,17 +1081,26 @@ impl EditorView {
             self.font_filter_backspace(cx);
             return;
         }
-        if self.vim_blocks() {
-            self.vim_key_apply(VimKey::Backspace, window, cx);
-            return;
-        }
         if self.search_open {
             if self.replace_open && self.replace_focus {
-                self.replace_text.pop();
-                cx.notify();
+                if self.search_fresh {
+                    self.replace_text.clear();
+                    self.search_fresh = false;
+                } else {
+                    self.replace_text.pop();
+                }
+            } else if self.search_fresh {
+                self.search_text.clear();
+                self.search_fresh = false;
+                self.refresh_search();
             } else {
                 self.search_backspace_impl(cx);
             }
+            cx.notify();
+            return;
+        }
+        if self.vim_blocks() {
+            self.vim_key_apply(VimKey::Backspace, window, cx);
             return;
         }
         let (a, b) = self.sel();
@@ -858,6 +1119,14 @@ impl EditorView {
             return;
         }
         if self.search_open {
+            if self.search_fresh {
+                self.search_text.clear();
+                self.replace_text.clear();
+                self.search_fresh = false;
+                self.refresh_search();
+                cx.notify();
+                return;
+            }
             if self.replace_open && self.replace_focus {
                 let mut chars: Vec<char> = self.replace_text.chars().collect();
                 while chars.last().is_some_and(|c| c.is_whitespace()) {
@@ -952,8 +1221,38 @@ impl EditorView {
         cx.notify();
     }
 
-    fn move_horizontal(&mut self, dir: i32, extend: bool, cx: &mut Context<Self>) {
+    fn move_horizontal(
+        &mut self,
+        dir: i32,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.modal_open() || self.vim_blocks() {
+            return;
+        }
+        let (a, b) = self.sel();
+        let target = if a != b && !extend {
+            if dir < 0 {
+                a
+            } else {
+                b
+            }
+        } else {
+            self.state.buffer.step_grapheme(self.cursor, dir)
+        };
+        let layout = self.layout(window);
+        let target = snap_hidden_link(&layout, target, dir);
+        self.cursor = target;
+        if !extend {
+            self.anchor = target;
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+Left/Right: jump to the previous/next word boundary.
+    fn move_word(&mut self, dir: i32, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
             return;
         }
         let (a, b) = self.sel();
@@ -961,13 +1260,21 @@ impl EditorView {
             let target = if dir < 0 { a } else { b };
             self.cursor = target;
             self.anchor = target;
-        } else {
-            let target = self.state.buffer.step_grapheme(self.cursor, dir);
-            self.cursor = target;
-            if !extend {
-                self.anchor = target;
-            }
+            cx.notify();
+            return;
         }
+        let target = if dir < 0 {
+            self.state.buffer.word_start_left(self.cursor)
+        } else {
+            self.state.buffer.word_end_right(self.cursor)
+        };
+        let layout = self.layout(window);
+        let target = snap_hidden_link(&layout, target, dir);
+        self.cursor = target;
+        if !extend {
+            self.anchor = target;
+        }
+        self.ensure_cursor_visible(window, cx);
         cx.notify();
     }
 
@@ -986,6 +1293,17 @@ impl EditorView {
         if self.modal_open() {
             return;
         }
+        self.move_vertical_impl(dir, extend, window, cx);
+    }
+
+    /// Move by display rows, ignoring the vim guard.
+    fn move_vertical_impl(
+        &mut self,
+        dir: i32,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let layout = self.layout(window);
         let Some((line_ix, x)) = caret_x(&layout, self.cursor) else {
             return;
@@ -994,12 +1312,40 @@ impl EditorView {
         let lh = line.line_height;
         let local_row_y = caret_in_line_y(
             &line.shaped,
-            line.display_col(self.cursor - line.start_char),
+            line.display_col((self.cursor - line.start_char).min(line.char_len)),
             lh,
         );
-        let target_y = line.top + local_row_y + lh * dir as f32;
+        // Aim at the middle of the target row; the boundary between rows maps
+        // to the previous row's last character.
+        let target_y = line.top + local_row_y + lh * dir as f32 + lh * 0.5;
         let target = index_for_layout_point(&layout, px(f32::from(x)), target_y);
-        self.move_to(target, extend, window, cx);
+        let chars = self.chars();
+        let mut target = target.min(chars.len());
+        // A newline can be the invisible join between two reflowed source
+        // lines: skip it so the move lands on the next visible character. But
+        // a newline that ends a block (a blank line or the end of a paragraph)
+        // is a real position; jumping over it made `k` a no-op at every
+        // section boundary.
+        if let Some(block) = layout.lines.iter().rev().find(|l| l.start_char <= target) {
+            let end = block.start_char + block.char_len;
+            if target < end && chars.get(target) == Some(&'\n') {
+                // Going down, take the next line's first character; going up,
+                // stay on the character before the join so the caret remains
+                // on the row we aimed at.
+                target = if dir < 0 {
+                    target.saturating_sub(1)
+                } else {
+                    target + 1
+                };
+            }
+        }
+        let target = snap_hidden_link(&layout, target, dir);
+        self.cursor = target;
+        if !extend {
+            self.anchor = target;
+        }
+        self.ensure_cursor_visible(window, cx);
+        cx.notify();
     }
 
     fn home(&mut self, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1072,16 +1418,22 @@ impl EditorView {
             self.choose_current_font(cx);
             return;
         }
-        if self.vim_blocks() {
-            self.vim_key_apply(VimKey::Enter, window, cx);
-            return;
-        }
         if self.search_open {
             if self.replace_open && self.replace_focus {
                 self.search_replace_current(window, cx);
-            } else {
+            } else if self.replace_open {
+                self.search_fresh = false;
                 self.goto_match(1, window, cx);
+            } else {
+                // Typing in the find bar has already selected the first
+                // match; Enter accepts it and hands the editor its focus
+                // back. Ctrl+G / Shift+Enter keep cycling.
+                self.accept_search(window, cx);
             }
+            return;
+        }
+        if self.vim_blocks() {
+            self.vim_key_apply(VimKey::Enter, window, cx);
             return;
         }
         let (a, b) = self.sel();
@@ -1105,8 +1457,10 @@ impl EditorView {
         if self.state.buffer.undo() {
             self.state.refresh_wordcount();
             let n = self.state.buffer.len_chars();
-            self.cursor = self.cursor.min(n);
-            self.anchor = self.anchor.min(n);
+            let back = self.undo_cursors.pop().unwrap_or(self.cursor).min(n);
+            self.redo_cursors.push(self.cursor);
+            self.cursor = back;
+            self.anchor = back;
             self.bump();
             self.refresh_search();
             self.schedule_autosave(cx);
@@ -1121,8 +1475,10 @@ impl EditorView {
         if self.state.buffer.redo() {
             self.state.refresh_wordcount();
             let n = self.state.buffer.len_chars();
-            self.cursor = self.cursor.min(n);
-            self.anchor = self.anchor.min(n);
+            let forward = self.redo_cursors.pop().unwrap_or(self.cursor).min(n);
+            self.undo_cursors.push(self.cursor);
+            self.cursor = forward;
+            self.anchor = forward;
             self.bump();
             self.refresh_search();
             self.schedule_autosave(cx);
@@ -1160,6 +1516,8 @@ impl EditorView {
             self.state.open(&p);
             self.cursor = 0;
             self.anchor = 0;
+            self.undo_cursors.clear();
+            self.redo_cursors.clear();
             self.set_scroll(0.0);
             self.bump();
             self.refresh_search();
@@ -1207,11 +1565,13 @@ impl EditorView {
                 }
             }
             let (nt, nc) = nemiq_core::mutations::toggle_wrap(&t, a, b, marker, span);
+            self.note_edit();
             self.state.set_text(nt);
             self.cursor = nc;
             self.anchor = nc;
         } else {
             let (nt, nc) = nemiq_core::mutations::toggle_wrap(&t, a, b, marker, None);
+            self.note_edit();
             self.state.set_text(nt);
             self.cursor = nc;
             self.anchor = nc;
@@ -1496,7 +1856,8 @@ impl EditorView {
             })
             .is_ok();
         if !copied {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.text()));
+            let text = self.text();
+            self.set_clipboard(text, false, cx);
         }
         self.state.status = "Copied as HTML.".to_string();
         cx.notify();
@@ -1523,7 +1884,7 @@ impl EditorView {
         if a != b {
             let t = self.text();
             let sel: String = t.chars().skip(a).take(b - a).collect();
-            cx.write_to_clipboard(ClipboardItem::new_string(sel));
+            self.set_clipboard(sel, false, cx);
             self.delete_selection_or(a, b, cx);
             let _ = w;
         }
@@ -1533,7 +1894,7 @@ impl EditorView {
         if a != b {
             let t = self.text();
             let sel: String = t.chars().skip(a).take(b - a).collect();
-            cx.write_to_clipboard(ClipboardItem::new_string(sel));
+            self.set_clipboard(sel, false, cx);
         }
     }
 
@@ -1601,6 +1962,7 @@ impl EditorView {
         }
         out.extend(chars[line_end..].iter());
         let shift = out.chars().count() as i64 - chars.len() as i64;
+        self.note_edit();
         self.state.set_text(out);
         let new_a = (a as i64 + if outdent { -4 } else { 4 }).max(0) as usize;
         let new_b = (b as i64 + shift).max(new_a as i64) as usize;
@@ -1632,10 +1994,22 @@ impl EditorView {
         self.ensure_cursor_visible(window, cx);
         cx.notify();
     }
+    /// Close the find bar but keep the query, matches and highlight so
+    /// `Ctrl+G` / `Shift+Enter` can continue from where it left off.
+    fn accept_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = false;
+        self.replace_open = false;
+        self.replace_focus = false;
+        self.search_fresh = false;
+        self.ensure_cursor_visible(window, cx);
+        cx.notify();
+    }
+
     fn open_search(&mut self, replace: bool, cx: &mut Context<Self>) {
         self.search_open = true;
         self.replace_open = replace;
         self.replace_focus = false;
+        self.search_fresh = !self.search_text.is_empty();
         self.refresh_search();
         self.jump_to_first_match(cx);
         cx.notify();
@@ -1647,6 +2021,7 @@ impl EditorView {
         }
         let pos = self.matches[self.match_idx as usize];
         let qlen = self.search_text.chars().count();
+        self.note_edit();
         let caret = self
             .state
             .apply_replace(pos, pos + qlen, self.replace_text.clone());
@@ -1690,6 +2065,7 @@ impl EditorView {
         }
         out.extend(chars[last..].iter());
         let total = chars.len();
+        self.note_edit();
         self.state.apply_replace(0, total, out);
         self.match_idx = -1;
         self.refresh_search();
@@ -1698,6 +2074,18 @@ impl EditorView {
         cx.notify();
     }
     fn close_search(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.link_expanded.is_some() {
+            // The destination is about to be hidden again; leave the caret on
+            // the visible link text instead of inside invisible syntax.
+            if let Some((start, _, _, _)) = self.link_at_cursor() {
+                self.cursor = (start + 1).min(self.state.buffer.len_chars());
+                self.anchor = self.cursor;
+            }
+            self.link_expanded = None;
+            self.bump();
+            cx.notify();
+            return;
+        }
         if self.palette_open {
             self.palette_open = false;
             self.palette_query.clear();
@@ -1725,10 +2113,19 @@ impl EditorView {
             self.search_open = false;
             self.replace_open = false;
             self.replace_focus = false;
+            self.search_fresh = false;
             if !self.vim_enabled {
                 self.matches.clear();
                 self.match_idx = -1;
             }
+            cx.notify();
+            return;
+        }
+        if !self.vim_enabled && !self.search_text.is_empty() {
+            // The bar is already closed; Esc clears the leftover highlight.
+            self.search_text.clear();
+            self.matches.clear();
+            self.match_idx = -1;
             cx.notify();
             return;
         }
@@ -1783,6 +2180,10 @@ impl EditorView {
     }
 
     fn search_append(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.search_fresh {
+            self.search_text.clear();
+            self.search_fresh = false;
+        }
         self.search_text.push_str(text);
         self.refresh_search();
         self.jump_to_first_match(cx);
@@ -1845,6 +2246,11 @@ impl EditorView {
             PaletteCmd::ZoomIn => self.zoom_in(&ZoomIn, window, cx),
             PaletteCmd::ZoomOut => self.zoom_out(&ZoomOut, window, cx),
             PaletteCmd::ZoomReset => self.zoom_reset(&ZoomReset, window, cx),
+            PaletteCmd::ToggleNumbers => {
+                self.state.show_numbers = !self.state.show_numbers;
+                self.state.save_numbers_pref(self.state.show_numbers);
+                self.bump();
+            }
             PaletteCmd::ToggleVim => {
                 self.vim_enabled = !self.vim_enabled;
                 self.vim = if self.vim_enabled {
@@ -1870,6 +2276,56 @@ impl EditorView {
             PaletteCmd::SelectAll => self.select_all(&SelectAll, window, cx),
         }
         cx.notify();
+    }
+
+    /// The link on the caret's line, if any: (doc start, doc end, source line, url).
+    fn link_at_cursor(&self) -> Option<(usize, usize, String, String)> {
+        let text = self.text();
+        let chars: Vec<char> = text.chars().collect();
+        let cursor = self.cursor.min(chars.len());
+        let mut line_start = cursor;
+        while line_start > 0 && chars[line_start - 1] != '\n' {
+            line_start -= 1;
+        }
+        let mut line_end = cursor;
+        while line_end < chars.len() && chars[line_end] != '\n' {
+            line_end += 1;
+        }
+        let line: String = chars[line_start..line_end].iter().collect();
+        for m in inline_markup(&line) {
+            if m.kind != InlineKind::Link {
+                continue;
+            }
+            let start = line_start + m.markers[0].start;
+            let end = line_start + m.markers[1].start + m.markers[1].length;
+            if cursor >= start && cursor < end {
+                let url = m
+                    .destination
+                    .map(|d| {
+                        chars[line_start + d.start
+                            ..(line_start + d.start + d.length).min(chars.len())]
+                            .iter()
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                return Some((start, end, line, url));
+            }
+        }
+        None
+    }
+
+    fn toggle_link_at_caret(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((start, _, _, _)) = self.link_at_cursor() else {
+            return false;
+        };
+        self.link_expanded = if self.link_expanded == Some(start) {
+            None
+        } else {
+            Some(start)
+        };
+        self.bump();
+        cx.notify();
+        true
     }
 
     // ---------- vim ----------
@@ -1919,9 +2375,22 @@ impl EditorView {
             }
             return;
         }
-        let Some(key) = Self::vim_key(ks) else {
+        let Some(mut key) = Self::vim_key(ks) else {
             return;
         };
+        // Some Wayland compositors report shift+letter with the lowercase
+        // character, so `V`, `G`, `A`… never reach the state machine.
+        if m.shift {
+            if let VimKey::Char(c) = key {
+                if c.is_ascii_lowercase() {
+                    key = VimKey::Char(c.to_ascii_uppercase());
+                }
+            }
+        }
+        // `p` follows the shared clipboard when another app changed it.
+        if self.vim.is_normal() && matches!(key, VimKey::Char('p') | VimKey::Char('P')) {
+            self.sync_clipboard_register(cx);
+        }
         let text = self.text();
         let cmd = self.vim.handle(&text, self.cursor, self.anchor, key);
         let handled = !matches!(cmd, VimCommand::None) || self.vim.is_normal();
@@ -1934,8 +2403,17 @@ impl EditorView {
     fn apply_vim(&mut self, cmd: VimCommand, window: &mut Window, cx: &mut Context<Self>) {
         match cmd {
             VimCommand::None => {}
+            VimCommand::MoveVertical { dir, count } => {
+                let extend = self.vim.is_visual();
+                for _ in 0..count.max(1) {
+                    self.move_vertical_impl(dir, extend, window, cx);
+                }
+            }
             VimCommand::Move { pos, extend } => {
                 let pos = pos.min(self.state.buffer.len_chars());
+                let dir = if pos >= self.cursor { 1 } else { -1 };
+                let layout = self.layout(window);
+                let pos = snap_hidden_link(&layout, pos, dir);
                 self.cursor = pos;
                 if !extend {
                     self.anchor = pos;
@@ -1958,11 +2436,36 @@ impl EditorView {
                 pos,
                 anchor,
             } => {
+                self.note_edit();
                 self.state.apply_replace(start, end, text);
                 let len = self.state.buffer.len_chars();
                 self.cursor = pos.min(len);
                 self.anchor = anchor.min(len);
                 self.after_edit(cx);
+                self.ensure_cursor_visible(window, cx);
+                cx.notify();
+            }
+            VimCommand::YankRow { count } => {
+                let layout = self.layout(window);
+                if let Some((start, end)) = display_row_range(&layout, self.cursor, count) {
+                    let t = self.text();
+                    let mut yanked: String = t
+                        .chars()
+                        .skip(start)
+                        .take(end.saturating_sub(start))
+                        // A row can end in the invisible join between two
+                        // reflowed source lines; copy the visible line, not a
+                        // newline.
+                        .map(|c| if c == '\n' { ' ' } else { c })
+                        .collect();
+                    while yanked.ends_with(' ') {
+                        yanked.pop();
+                    }
+                    self.vim.set_register(yanked.clone(), true);
+                    self.set_clipboard(yanked, true, cx);
+                    self.state.status = format!("Yanked {} line(s)", count.max(1));
+                    self.flash_yank(start, end, cx);
+                }
                 self.ensure_cursor_visible(window, cx);
                 cx.notify();
             }
@@ -1977,7 +2480,7 @@ impl EditorView {
                     .skip(start)
                     .take(end.saturating_sub(start))
                     .collect();
-                cx.write_to_clipboard(ClipboardItem::new_string(yanked.clone()));
+                self.set_clipboard(yanked.clone(), linewise, cx);
                 self.state.status = if linewise {
                     format!("Yanked {} line(s)", yanked.matches('\n').count().max(1))
                 } else {
@@ -1988,6 +2491,7 @@ impl EditorView {
                     self.cursor = start;
                     self.anchor = start;
                 }
+                self.flash_yank(start, end, cx);
                 cx.notify();
             }
             VimCommand::Search { .. } => {
@@ -2059,6 +2563,8 @@ impl EditorView {
                     self.state.open(&path);
                     self.cursor = 0;
                     self.anchor = 0;
+                    self.undo_cursors.clear();
+                    self.redo_cursors.clear();
                     self.bump();
                     self.refresh_search();
                 }
@@ -2075,6 +2581,14 @@ impl EditorView {
                     self.vim = VimState::new();
                     self.state.save_vim_pref(false);
                     self.state.status = "Vim mode off".to_string();
+                }
+                Some("number") | Some("nu") => {
+                    self.state.show_numbers = true;
+                    self.state.save_numbers_pref(true);
+                }
+                Some("nonumber") | Some("nonu") => {
+                    self.state.show_numbers = false;
+                    self.state.save_numbers_pref(false);
                 }
                 _ => self.state.status = "set: expected vim or novim".to_string(),
             },
@@ -2582,27 +3096,165 @@ fn word_bounds(text: &str, at: usize) -> (usize, usize) {
 
 fn caret_line_rect(layout: &Layout, cursor: usize) -> Option<(Pixels, Pixels)> {
     let line = layout.lines.iter().rev().find(|l| l.start_char <= cursor)?;
-    let local = cursor - line.start_char;
+    let local = (cursor - line.start_char).min(line.char_len);
     let y = caret_in_line_y(&line.shaped, line.display_col(local), line.line_height);
     Some((line.top + y, line.line_height))
 }
 
-fn caret_x(layout: &Layout, cursor: usize) -> Option<(usize, Pixels)> {
-    for (i, line) in layout.lines.iter().enumerate() {
-        if cursor >= line.start_char && cursor <= line.start_char + line.char_len {
-            let local = line.display_col(cursor - line.start_char);
-            let byte = char_to_byte(line.shaped.text.as_ref(), local);
-            let p = line.shaped.position_for_index(byte, line.line_height);
-            return Some((i, px(p.map(|p| f32::from(p.x)).unwrap_or(0.0))));
+/// Byte offsets where each wrapped row starts.
+fn row_start_bytes(shaped: &WrappedLine) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for boundary in shaped.wrap_boundaries() {
+        if let Some(run) = shaped.runs().get(boundary.run_ix) {
+            if let Some(glyph) = run.glyphs.get(boundary.glyph_ix) {
+                starts.push(glyph.index);
+            }
         }
     }
-    None
+    starts
+}
+
+/// Caret position for a display index. A row's first character belongs to the
+/// previous row as far as `position_for_index` is concerned, so handle row
+/// starts explicitly — otherwise the caret (and vertical moves) drift to the
+/// end of the previous row.
+fn caret_point(shaped: &WrappedLine, local_display: usize, lh: Pixels) -> Option<Point<Pixels>> {
+    let byte = char_to_byte(shaped.text.as_ref(), local_display);
+    let starts = row_start_bytes(shaped);
+    if let Some(row) = starts.iter().rposition(|&s| s == byte) {
+        if row > 0 {
+            return Some(point(Pixels::ZERO, px(row as f32 * f32::from(lh))));
+        }
+    }
+    shaped.position_for_index(byte, lh)
+}
+
+/// Doc ranges of every displayed row of a block.
+fn row_doc_ranges(line: &LineBox) -> Vec<(usize, usize)> {
+    let text = line.shaped.text.as_ref();
+    let starts = row_start_bytes(&line.shaped);
+    let mut rows = Vec::with_capacity(starts.len());
+    for (r, &sb) in starts.iter().enumerate() {
+        let eb = starts.get(r + 1).copied().unwrap_or(text.len());
+        let d0 = byte_to_char(text, sb);
+        let d1 = byte_to_char(text, eb);
+        let doc0 = line.disp_to_doc.get(d0).copied().unwrap_or(line.char_len);
+        let doc1 = if d1 > d0 {
+            line.disp_to_doc.get(d1 - 1).map(|&d| d + 1).unwrap_or(doc0)
+        } else {
+            doc0
+        };
+        rows.push((
+            line.start_char + doc0.min(line.char_len),
+            line.start_char + doc1.min(line.char_len),
+        ));
+    }
+    rows
+}
+
+/// Doc range covered by `count` displayed rows starting at the cursor's row.
+fn display_row_range(layout: &Layout, cursor: usize, count: usize) -> Option<(usize, usize)> {
+    let (line_ix, _) = caret_x(layout, cursor)?;
+    let first = &layout.lines[line_ix];
+    let lh = first.line_height;
+    let local = first.display_col((cursor - first.start_char).min(first.char_len));
+    let start_row =
+        (f32::from(caret_in_line_y(&first.shaped, local, lh)) / f32::from(lh)).round() as usize;
+
+    let want = count.max(1);
+    let mut rows = Vec::with_capacity(want);
+    for line in layout.lines.iter().skip(line_ix) {
+        for (i, range) in row_doc_ranges(line).into_iter().enumerate() {
+            if std::ptr::eq(line, first) && i < start_row {
+                continue;
+            }
+            rows.push(range);
+            if rows.len() == want {
+                break;
+            }
+        }
+        if rows.len() == want {
+            break;
+        }
+    }
+    let start = rows.first()?.0;
+    let end = rows.last()?.1;
+    Some((start, end.max(start)))
+}
+
+/// Doc range of the source line containing `pos` inside a block. A block can
+/// reflow several source lines, so this is narrower than the block itself;
+/// linewise visual mode needs the real line.
+fn source_line_range(line: &LineBox, pos: usize) -> (usize, usize) {
+    let chars: Vec<char> = line.src.chars().collect();
+    let mut a = (pos - line.start_char).min(chars.len());
+    let mut b = a;
+    while a > 0 && chars[a - 1] != '\n' {
+        a -= 1;
+    }
+    while b < chars.len() && chars[b] != '\n' {
+        b += 1;
+    }
+    (line.start_char + a, line.start_char + b)
+}
+
+/// Doc-local ranges of a collapsed link's syntax. The link text stays visible;
+/// the brackets and destination are hidden no matter where the caret is, unless
+/// the link has been expanded with `Ctrl+E`.
+fn collapsed_link_ranges(
+    line: &str,
+    line_start: usize,
+    expanded: Option<usize>,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for m in inline_markup(line) {
+        if m.kind != InlineKind::Link || expanded == Some(line_start + m.markers[0].start) {
+            continue;
+        }
+        for marker in m.markers {
+            ranges.push((marker.start, marker.start + marker.length));
+        }
+    }
+    ranges
+}
+
+/// A collapsed link has document offsets with no glyph of their own. A caret
+/// resting on one is drawn over the previous visible character, which makes
+/// `h`/`l` look frozen (and needs dozens of presses to walk through a URL).
+/// Snap past the hidden run instead, in the direction the user was moving.
+fn snap_hidden_link(layout: &Layout, pos: usize, dir: i32) -> usize {
+    let Some(line) = layout.lines.iter().rev().find(|l| l.start_char <= pos) else {
+        return pos;
+    };
+    let local = pos - line.start_char;
+    let Some(&(a, b)) = line
+        .hidden_links
+        .iter()
+        .find(|&&(a, b)| local >= a && local < b)
+    else {
+        return pos;
+    };
+    let local = if dir < 0 { a.saturating_sub(1) } else { b };
+    line.start_char + local.min(line.char_len)
+}
+
+fn caret_x(layout: &Layout, cursor: usize) -> Option<(usize, Pixels)> {
+    // Blocks are separated by newline characters that belong to no block, so
+    // fall back to the nearest block at or before the cursor instead of
+    // returning None (which used to make vertical motion simply stop).
+    let (i, line) = layout
+        .lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, l)| l.start_char <= cursor)?;
+    let local = line.display_col((cursor - line.start_char).min(line.char_len));
+    let p = caret_point(&line.shaped, local, line.line_height);
+    Some((i, px(p.map(|p| f32::from(p.x)).unwrap_or(0.0))))
 }
 
 fn caret_in_line_y(shaped: &WrappedLine, local_chars: usize, lh: Pixels) -> Pixels {
-    let byte = char_to_byte(shaped.text.as_ref(), local_chars);
-    shaped
-        .position_for_index(byte, lh)
+    caret_point(shaped, local_chars, lh)
         .map(|p| px(f32::from(p.y)))
         .unwrap_or(px(0.))
 }
@@ -2736,7 +3388,8 @@ fn line_styles(line: &str, p: &Palette, fence: bool) -> Vec<CharStyle> {
 
     for span in nemiq_core::code_spans(line) {
         set(&mut styles, span.start, span.length, &|s| {
-            s.bg = Some(p.code_bg);
+            s.bg = None;
+            s.color = p.inline_fg;
             s.italic = false;
             s.weight = FontWeight::NORMAL;
         });
@@ -2773,13 +3426,20 @@ fn build_display(
     line_start: usize,
     cursor: usize,
     table: Option<&TableLine>,
+    link_expanded: Option<usize>,
 ) -> (Vec<char>, Vec<usize>, Vec<usize>) {
     let chars: Vec<char> = line.chars().collect();
     if let Some(table) = table {
-        return table_display(&chars, table);
+        let hide = hidden_markers(&chars);
+        return table_display(&chars, table, &hide);
     }
     let mut hide = vec![false; chars.len()];
     let on_line = cursor >= line_start && cursor <= line_start + chars.len();
+    let bullet = if !fence && !on_line {
+        bullet_prefix(&chars)
+    } else {
+        None
+    };
     if !fence && !on_line {
         if is_thematic_break(line) {
             // A horizontal rule reads better than a row of dashes.
@@ -2797,11 +3457,34 @@ fn build_display(
         }
     }
     if !fence {
+        // Code span backticks only appear while the caret is inside the span.
+        let caret_local = if on_line {
+            cursor - line_start
+        } else {
+            usize::MAX
+        };
+        for span in nemiq_core::code_spans(line) {
+            if span.length < 2 {
+                continue;
+            }
+            let close = span.start + span.length - 1;
+            if !(caret_local >= span.start && caret_local <= close) {
+                hide[span.start] = true;
+                hide[close] = true;
+            }
+        }
         for m in inline_markup(line) {
             let start = m.markers[0].start;
             let end = m.markers[1].start + m.markers[1].length;
-            let caret_local = cursor.saturating_sub(line_start);
-            let at_caret = caret_local >= start && caret_local <= end;
+            // Only a caret on *this* line can be "in" a span.
+            let in_span = caret_local >= start && caret_local <= end;
+            let at_caret = if m.kind == InlineKind::Link {
+                // Links stay compact no matter where the caret is; Tab opens
+                // one link into its source form and Escape closes it again.
+                link_expanded == Some(line_start + start)
+            } else {
+                in_span
+            };
             if !at_caret {
                 for marker in m.markers {
                     for i in marker.start..(marker.start + marker.length).min(hide.len()) {
@@ -2815,6 +3498,19 @@ fn build_display(
     let mut disp_to_doc = Vec::with_capacity(chars.len());
     let mut doc_to_disp = vec![usize::MAX; chars.len()];
     for (i, &c) in chars.iter().enumerate() {
+        if let Some((start, end, depth)) = bullet {
+            if i == start {
+                doc_to_disp[i] = display.len();
+                disp_to_doc.push(i);
+                display.push(['\u{2022}', '\u{25e6}', '\u{25aa}'][depth.min(2)]);
+                display.push(' ');
+                disp_to_doc.push(end.saturating_sub(1).min(chars.len().saturating_sub(1)));
+                continue;
+            }
+            if i < end {
+                continue;
+            }
+        }
         if hide[i] {
             continue;
         }
@@ -2874,6 +3570,101 @@ struct TableLine {
     widths: Vec<usize>,
     cells: Vec<(usize, usize)>,
     separator: bool,
+    header: bool,
+}
+
+/// Marker characters of inline markup (backticks, `**`, `_`, …), for previews
+/// where the caret can never be inside them.
+fn hidden_markers(chars: &[char]) -> Vec<bool> {
+    let mut hide = vec![false; chars.len()];
+    let line: String = chars.iter().collect();
+    for span in nemiq_core::code_spans(&line) {
+        if span.length >= 2 {
+            hide[span.start] = true;
+            hide[span.start + span.length - 1] = true;
+        }
+    }
+    for span in inline_markup(&line) {
+        for marker in span.markers {
+            for slot in hide
+                .iter_mut()
+                .take((marker.start + marker.length).min(chars.len()))
+                .skip(marker.start)
+            {
+                *slot = true;
+            }
+        }
+    }
+    hide
+}
+
+/// `- `, `* `, `+ ` bullets: (marker start, end after the space, depth).
+fn bullet_prefix(chars: &[char]) -> Option<(usize, usize, usize)> {
+    let line: String = chars.iter().collect();
+    if is_thematic_break(&line) {
+        return None;
+    }
+    let indent = chars.iter().take_while(|&&c| c == ' ').count();
+    match chars.get(indent) {
+        Some('-') | Some('*') | Some('+') => match chars.get(indent + 1) {
+            Some(' ') => Some((indent, indent + 2, indent / 2)),
+            // A marker with nothing after it is still an empty list item.
+            // Treating it as plain text made deleting the trailing space glue
+            // the bare marker onto the item above in the preview.
+            None => Some((indent, indent + 1, indent / 2)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A line that always stands on its own (starts a new block).
+fn starts_block(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    if line.trim().is_empty()
+        || is_fence_delimiter(line)
+        || heading_marker(&chars).is_some()
+        || is_thematic_break(line)
+        || bullet_prefix(&chars).is_some()
+        || is_table_row(line)
+    {
+        return true;
+    }
+    let t = line.trim_start();
+    if t.starts_with('>') {
+        return true;
+    }
+    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && matches!(t.chars().nth(digits), Some('.') | Some(')'))
+}
+
+/// Whether `next` continues the paragraph that started at `start`.
+fn joins_paragraph(
+    lines: &[&str],
+    start: usize,
+    next: usize,
+    fences: &[bool],
+    tables: &[Option<TableLine>],
+) -> bool {
+    if tables.get(start).is_some_and(|t| t.is_some())
+        || tables.get(next).is_some_and(|t| t.is_some())
+        || *fences.get(start).unwrap_or(&false)
+        || *fences.get(next).unwrap_or(&false)
+    {
+        return false;
+    }
+    let a = lines[start];
+    let b = lines[next];
+    if a.trim().is_empty() || b.trim().is_empty() {
+        return false;
+    }
+    // A paragraph, list item or quote can absorb continuation lines, but a
+    // heading, rule or fence is always a one-line block.
+    let ac: Vec<char> = a.chars().collect();
+    if heading_marker(&ac).is_some() || is_thematic_break(a) || is_fence_delimiter(a) {
+        return false;
+    }
+    !starts_block(b)
 }
 
 fn is_fence_delimiter(line: &str) -> bool {
@@ -2980,12 +3771,16 @@ fn table_lines(lines: &[&str], caret_line: usize, fences: &[bool]) -> Vec<Option
         let mut parsed: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
         for (row, line) in lines.iter().enumerate().take(end).skip(i) {
             let chars: Vec<char> = line.chars().collect();
+            let hide = hidden_markers(&chars);
             let spans = cell_spans(&chars);
             for (col, &(s, e)) in spans.iter().enumerate() {
                 if col >= widths.len() {
                     widths.resize(col + 1, 0);
                 }
-                widths[col] = widths[col].max(e.saturating_sub(s));
+                let visible = (s..e)
+                    .filter(|i| !hide.get(*i).copied().unwrap_or(false))
+                    .count();
+                widths[col] = widths[col].max(visible);
             }
             parsed.push((row, spans));
         }
@@ -2994,6 +3789,7 @@ fn table_lines(lines: &[&str], caret_line: usize, fences: &[bool]) -> Vec<Option
                 widths: widths.clone(),
                 cells,
                 separator: row == i + 1,
+                header: row == i,
             });
         }
         i = end;
@@ -3001,7 +3797,11 @@ fn table_lines(lines: &[&str], caret_line: usize, fences: &[bool]) -> Vec<Option
     out
 }
 
-fn table_display(chars: &[char], table: &TableLine) -> (Vec<char>, Vec<usize>, Vec<usize>) {
+fn table_display(
+    chars: &[char],
+    table: &TableLine,
+    hide: &[bool],
+) -> (Vec<char>, Vec<usize>, Vec<usize>) {
     let mut display: Vec<char> = Vec::new();
     let mut disp_to_doc: Vec<usize> = Vec::new();
     let mut doc_to_disp = vec![usize::MAX; chars.len()];
@@ -3021,13 +3821,18 @@ fn table_display(chars: &[char], table: &TableLine) -> (Vec<char>, Vec<usize>, V
                 disp_to_doc.push(anchor);
             }
         } else {
+            let mut visible = 0usize;
             for i in start..end {
+                if hide.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
                 doc_to_disp[i] = display.len();
                 display.push(chars[i]);
                 disp_to_doc.push(i);
+                visible += 1;
             }
             let anchor = end.saturating_sub(1).min(chars.len().saturating_sub(1));
-            for _ in (end - start)..width {
+            for _ in visible..width {
                 display.push(' ');
                 disp_to_doc.push(anchor);
             }
@@ -3064,10 +3869,6 @@ fn structural_marker(chars: &[char]) -> Option<(usize, usize)> {
     }
     if let Some((width, content)) = quote_marker(chars) {
         return Some((content.saturating_sub(width), content));
-    }
-    if let Some(width) = list_marker(chars) {
-        let indent = chars.iter().take_while(|&&c| c == ' ').count();
-        return Some((indent, width));
     }
     None
 }
@@ -3157,6 +3958,10 @@ pub struct Prepaint {
     focused: bool,
     scrollbar_alpha: f32,
     vim_normal: bool,
+    visual_line: bool,
+    link_expanded: Option<usize>,
+    show_numbers: bool,
+    yank_flash: Option<(usize, usize)>,
 }
 
 impl Element for EditorElement {
@@ -3222,6 +4027,10 @@ impl Element for EditorElement {
             match_idx: view.match_idx,
             focused: view.focus.is_focused(_window),
             vim_normal: view.vim_enabled && view.vim.is_normal(),
+            visual_line: view.vim_enabled && view.vim.is_visual() && view.vim.visual_line(),
+            link_expanded: view.link_expanded,
+            show_numbers: view.state.show_numbers,
+            yank_flash: view.yank_flash,
         }
     }
     fn paint(
@@ -3278,8 +4087,98 @@ impl Element for EditorElement {
                 .ok();
         }
 
+        // Line numbers in the left margin, per source line.
+        if p.show_numbers {
+            let scale = f32::from(p.layout.font_size) / BASE_FONT_PX;
+            let num_size = px(10.0 * scale);
+            let style = window.text_style();
+            for line in &p.layout.lines {
+                let top = p.y0 + line.top - p.scroll;
+                if top + line.height < bounds.top() || top > bounds.bottom() {
+                    continue;
+                }
+                let mut doc_off = 0usize;
+                // A source line can start mid-row in a reflowed paragraph; only
+                // the first number per display row is drawn, so they never
+                // overprint each other.
+                let mut last_row_y = -1.0f32;
+                for (k, part) in line.src.split('\n').enumerate() {
+                    let disp = line.display_col(doc_off);
+                    // `position_for_index` puts a row's first character at the
+                    // end of the previous row; `caret_point` knows the row
+                    // starts.
+                    let dy = caret_point(&line.shaped, disp, line.line_height)
+                        .map(|q| f32::from(q.y))
+                        .unwrap_or(0.0);
+                    if (dy - last_row_y).abs() < 0.5 {
+                        doc_off += part.chars().count() + 1;
+                        continue;
+                    }
+                    last_row_y = dy;
+                    let label = (line.first_line + k).to_string();
+                    let run = TextRun {
+                        len: label.len(),
+                        font: Font {
+                            family: p.palette.mono.clone(),
+                            ..style.font()
+                        },
+                        color: p.palette.marker,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    if let Ok(mut shaped) = window.text_system().shape_text(
+                        SharedString::from(label),
+                        num_size,
+                        &[run],
+                        None,
+                        None,
+                    ) {
+                        if let Some(t) = shaped.drain(..).next() {
+                            // Right-aligned in a fixed gutter at the window edge,
+                            // so the numbers never drift with the column. Paint
+                            // with the row's line height so the number is
+                            // centred on the row exactly like the text is.
+                            // Collapsed fence markers are only a few pixels
+                            // tall; centre inside that strip, not a full row.
+                            let row_h = if line.height < line.line_height {
+                                line.height
+                            } else {
+                                line.line_height
+                            };
+                            let w = t.size(row_h).width;
+                            let x = bounds.left() + px(34.0 * scale) - w;
+                            if x + w < p.x0 - px(4.) {
+                                t.paint(
+                                    point(x, top + px(dy)),
+                                    row_h,
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                )
+                                .ok();
+                            }
+                        }
+                    }
+                    doc_off += part.chars().count() + 1;
+                }
+            }
+        }
+
         // Selection
-        let (sa, sb) = (p.anchor.min(p.cursor), p.anchor.max(p.cursor));
+        let (mut sa, mut sb) = (p.anchor.min(p.cursor), p.anchor.max(p.cursor));
+        if p.visual_line {
+            // `V` selects *source* lines, not whole reflowed blocks: those can
+            // hold several lines, so highlighting the block made the selection
+            // say far more than `d`/`y` would actually take.
+            if let Some(line) = p.layout.lines.iter().rev().find(|l| l.start_char <= sa) {
+                sa = source_line_range(line, sa).0;
+            }
+            if let Some(line) = p.layout.lines.iter().rev().find(|l| l.start_char <= sb) {
+                sb = source_line_range(line, sb).1;
+            }
+        }
         if sa != sb {
             for line in &p.layout.lines {
                 let ls = line.start_char;
@@ -3294,6 +4193,45 @@ impl Element for EditorElement {
                 let la = sa.max(ls) - ls;
                 let lb = sb.min(le) - ls;
                 let (la, lb) = line.display_range(la, lb);
+                if la >= lb {
+                    // A blank (or collapsed fence) line has no glyphs to
+                    // select, but it is still part of a linewise selection.
+                    // Draw the whole row so the selection reads as continuous.
+                    if p.visual_line && sa <= ls && le <= sb {
+                        window.paint_quad(fill(
+                            Bounds::new(point(p.x0, top), size(p.layout.wrap_width, line.height)),
+                            p.palette.selection,
+                        ));
+                    }
+                    continue;
+                }
+                paint_selection(
+                    window,
+                    &line.shaped,
+                    la,
+                    lb,
+                    line.disp_to_doc.len(),
+                    point(p.x0, top),
+                    line.line_height,
+                    p.layout.wrap_width,
+                    p.palette.selection,
+                );
+            }
+        }
+
+        // Yank flash: the range that just went to the register.
+        if let Some((fa, fb)) = p.yank_flash {
+            for line in &p.layout.lines {
+                let ls = line.start_char;
+                let le = line.start_char + line.char_len;
+                if fb <= ls || fa >= le {
+                    continue;
+                }
+                let top = p.y0 + line.top - p.scroll;
+                if top + line.height < bounds.top() || top > bounds.bottom() {
+                    continue;
+                }
+                let (la, lb) = line.display_range(fa.max(ls) - ls, fb.min(le) - ls);
                 if la >= lb {
                     continue;
                 }
@@ -3398,6 +4336,69 @@ impl Element for EditorElement {
             }
         }
 
+        // Link tooltip: the destination while the caret sits on a link.
+        if p.link_expanded.is_none() {
+            if let Some((_line, dx, dy, url)) = link_tip(p) {
+                let scale = f32::from(p.layout.font_size) / BASE_FONT_PX;
+                let mut label = url.clone();
+                if label.chars().count() > 72 {
+                    label = label.chars().take(71).collect::<String>() + "…";
+                }
+                let label = format!("{label}   ·   Ctrl+E to expand");
+                let tip_size = px(11.0 * scale);
+                let style = window.text_style();
+                let run = TextRun {
+                    len: label.len(),
+                    font: Font {
+                        family: p.palette.mono.clone(),
+                        ..style.font()
+                    },
+                    color: p.palette.muted,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                if let Ok(mut shaped) = window.text_system().shape_text(
+                    SharedString::from(label),
+                    tip_size,
+                    &[run],
+                    None,
+                    None,
+                ) {
+                    if let Some(text) = shaped.drain(..).next() {
+                        let text_size = text.size(px(f32::from(tip_size) * 1.4));
+                        let pad = px(7.0 * scale);
+                        let w = text_size.width + pad * 2.0;
+                        let h = text_size.height + pad;
+                        let mut x = p.x0 + dx;
+                        if x + w > bounds.right() - px(8.0) {
+                            x = bounds.right() - w - px(8.0);
+                        }
+                        let y = (p.y0 + dy).min(bounds.bottom() - h - px(4.0));
+                        let box_rect = Bounds::new(point(x, y), size(w, h));
+                        window.paint_quad(fill(box_rect, p.palette.bg));
+                        window.paint_quad(gpui::PaintQuad {
+                            bounds: box_rect,
+                            background: transparent_black().into(),
+                            border_color: p.palette.muted.opacity(0.45),
+                            border_widths: Edges::all(px(1.)),
+                            border_style: BorderStyle::Solid,
+                            corner_radii: Corners::all(px(4.)),
+                        });
+                        text.paint(
+                            point(x + pad, y + pad * 0.4),
+                            px(f32::from(tip_size) * 1.4),
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
+                        .ok();
+                    }
+                }
+            }
+        }
+
         // Placeholder
         if p.layout.lines.len() == 1 && p.layout.lines[0].char_len == 0 && !p.focused {
             let placeholder = "# Start writing";
@@ -3452,6 +4453,45 @@ impl Element for EditorElement {
             }
         }
     }
+}
+
+/// Where to draw the link tooltip: (line top, x, y offset, url).
+fn link_tip(p: &Prepaint) -> Option<(&LineBox, Pixels, Pixels, String)> {
+    let line = p
+        .layout
+        .lines
+        .iter()
+        .rev()
+        .find(|l| p.cursor >= l.start_char && p.cursor <= l.start_char + l.char_len)?;
+    let local = p.cursor - line.start_char;
+    let chars: Vec<char> = line.src.chars().collect();
+    for m in inline_markup(&line.src) {
+        if m.kind != InlineKind::Link {
+            continue;
+        }
+        let start = m.markers[0].start;
+        let end = m.markers[1].start + m.markers[1].length;
+        if local < start || local >= end {
+            continue;
+        }
+        if p.link_expanded == Some(line.start_char + start) {
+            return None;
+        }
+        let url = m
+            .destination
+            .map(|d| {
+                chars[d.start.min(chars.len())..(d.start + d.length).min(chars.len())]
+                    .iter()
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        let disp = line.display_col(start);
+        let byte = char_to_byte(line.shaped.text.as_ref(), disp);
+        let pos = line.shaped.position_for_index(byte, line.line_height)?;
+        let top = line.top + px(f32::from(pos.y)) + line.line_height;
+        return Some((line, px(f32::from(pos.x)), top, url));
+    }
+    None
 }
 
 fn paint_selection(
@@ -3634,6 +4674,11 @@ impl Render for EditorView {
                                 .flex_1()
                                 .cursor_text()
                                 .text_color(label_color)
+                                .bg(if self.search_fresh && !self.search_text.is_empty() {
+                                    palette.selection.opacity(0.45)
+                                } else {
+                                    palette.bg.opacity(0.0)
+                                })
                                 .child(label)
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -4316,7 +5361,7 @@ impl Render for EditorView {
                 if v.vim_blocks() {
                     v.vim_key_apply(VimKey::Left, w, cx);
                 } else {
-                    v.move_horizontal(-1, false, cx);
+                    v.move_horizontal(-1, false, w, cx);
                     v.ensure_cursor_visible(w, cx);
                 }
             }))
@@ -4324,15 +5369,31 @@ impl Render for EditorView {
                 if v.vim_blocks() {
                     v.vim_key_apply(VimKey::Right, w, cx);
                 } else {
-                    v.move_horizontal(1, false, cx);
+                    v.move_horizontal(1, false, w, cx);
                     v.ensure_cursor_visible(w, cx);
                 }
             }))
             .on_action(
-                cx.listener(|v: &mut Self, _: &SelectLeft, _w, cx| v.move_horizontal(-1, true, cx)),
+                cx.listener(|v: &mut Self, _: &SelectLeft, w, cx| {
+                    v.move_horizontal(-1, true, w, cx)
+                }),
             )
             .on_action(
-                cx.listener(|v: &mut Self, _: &SelectRight, _w, cx| v.move_horizontal(1, true, cx)),
+                cx.listener(|v: &mut Self, _: &SelectRight, w, cx| {
+                    v.move_horizontal(1, true, w, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|v: &mut Self, _: &WordLeft, w, cx| v.move_word(-1, false, w, cx)),
+            )
+            .on_action(
+                cx.listener(|v: &mut Self, _: &WordRight, w, cx| v.move_word(1, false, w, cx)),
+            )
+            .on_action(
+                cx.listener(|v: &mut Self, _: &SelectWordLeft, w, cx| v.move_word(-1, true, w, cx)),
+            )
+            .on_action(
+                cx.listener(|v: &mut Self, _: &SelectWordRight, w, cx| v.move_word(1, true, w, cx)),
             )
             .on_action(cx.listener(|v: &mut Self, _: &Up, w, cx| {
                 if v.palette_open {
@@ -4419,6 +5480,15 @@ impl Render for EditorView {
             }))
             .on_action(cx.listener(|v: &mut Self, a: &Shortcuts, w, cx| v.open_shortcuts(a, w, cx)))
             .on_action(cx.listener(|v: &mut Self, _: &OpenPalette, w, cx| v.open_palette(w, cx)))
+            .on_action(cx.listener(|v: &mut Self, _: &ExpandLink, _, cx| {
+                v.toggle_link_at_caret(cx);
+            }))
+            .on_action(cx.listener(|v: &mut Self, _: &ToggleNumbers, _, cx| {
+                v.state.show_numbers = !v.state.show_numbers;
+                v.state.save_numbers_pref(v.state.show_numbers);
+                v.bump();
+                cx.notify();
+            }))
             .on_action(cx.listener(|v: &mut Self, _: &DialogCancel, w, cx| {
                 if v.close_prompt {
                     v.dialog_cancel(w, cx);
@@ -4463,9 +5533,11 @@ impl Render for EditorView {
             .children(cmdline_bar)
             .child(
                 div()
+                    .w_full()
                     .flex()
                     .flex_row()
                     .items_center()
+                    .justify_between()
                     .h(self.footer_height())
                     .px_3()
                     .gap_3()
@@ -4570,6 +5642,7 @@ enum PaletteCmd {
     ZoomOut,
     ZoomReset,
     ToggleVim,
+    ToggleNumbers,
     FontPicker,
     CopyHtml,
     Bold,
@@ -4653,6 +5726,11 @@ const PALETTE: &[PaletteEntry] = &[
         label: "Toggle Vim Mode",
         hint: "",
         cmd: PaletteCmd::ToggleVim,
+    },
+    PaletteEntry {
+        label: "Toggle Line Numbers",
+        hint: "Ctrl+Shift+L",
+        cmd: PaletteCmd::ToggleNumbers,
     },
     PaletteEntry {
         label: "Change Font",
